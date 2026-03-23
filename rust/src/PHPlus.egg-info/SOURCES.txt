@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-src/PHPlus.egg-info/PKG-INFO
-src/PHPlus.egg-info/SOURCES.txt
-src/PHPlus.egg-info/dependency_links.txt
-src/PHPlus.egg-info/entry_points.txt
-src/PHPlus.egg-info/top_level.txt
