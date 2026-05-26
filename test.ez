@@ -10,4 +10,4 @@ print premek - numtest
 
 print premek || numtest
 
-let print
+let print = 
