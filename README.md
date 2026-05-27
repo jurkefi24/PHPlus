@@ -11,11 +11,11 @@ Future:
 2. `phplus [your_file_name].ez`
 
 ## FUNCTIONALITY
-I'd like this to be a less brainnumbingly stupid version of PHP
+I'd like this to be a less brainnumbingly stupid version of PHP\
 ### CURRENTLY
-just let and print
+let and print\
+statements like if, for or while\
 
 ### FUTURE
-usual statements like if, for or while\
 hopefully strict typing (at least before compile)\
 better OOP implementation (no `$object->attribute`, but `object.attribute`)
