@@ -4,6 +4,7 @@ use std::fmt;
 
 // --- ERROR TYPE ---
 
+/// Represents a compiler error with a human-readable message and the source location where it occurred.
 #[derive(Debug)]
 struct LangError {
 	message: String,
@@ -12,12 +13,14 @@ struct LangError {
 }
 
 impl LangError {
+	/// Creates a new `LangError` with the given message, line number, and column number.
 	fn new(message: impl Into<String>, line: usize, col: usize) -> Self {
 		LangError { message: message.into(), line, col }
 	}
 }
 
 impl fmt::Display for LangError {
+	/// Formats the error as `[line:col] Error: message` for printing to stderr.
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "[{}:{}] Error: {}", self.line, self.col, self.message)
 	}
@@ -31,6 +34,9 @@ enum TokenKind {
 	Let,            // variable definition
 	If,             // if keyword
 	Else,           // else keyword
+	While,          // while keyword
+	For,            // for keyword
+	Semicolon,      // ; used as separator in for loops
 
 	// data types
 	String,
@@ -59,8 +65,12 @@ enum TokenKind {
 	RParen, // )
 	LBrace, // {
 	RBrace, // }
+	True,   // true
+	False,  // false
 }
 
+/// A single lexical unit produced by the lexer.
+/// Stores the token's kind, its raw source string, and the source location it came from.
 #[derive(Debug, Clone)]
 struct Token {  //Pairs the data type and the value from source code
 	kind: TokenKind,
@@ -69,6 +79,14 @@ struct Token {  //Pairs the data type and the value from source code
 	col: usize,
 }
 
+/// Converts raw EzLang source code into a flat list of tokens.
+///
+/// Walks the source string character by character, classifying each chunk into
+/// a `Token` with kind, value, and source location. Whitespace is skipped.
+///
+/// # Errors
+/// Returns a `LangError` on: unexpected characters, unterminated strings,
+/// malformed numbers (multiple decimal points), or lone `&` / `|`.
 fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 	let mut tokens = Vec::new();
 	let mut chars = code.chars().peekable();
@@ -127,6 +145,11 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 					"let"   => TokenKind::Let,
 					"if"    => TokenKind::If,
 					"else"  => TokenKind::Else,
+					"while" => TokenKind::While,
+					"for"   => TokenKind::For,
+					"true"  => TokenKind::True,
+					"false" => TokenKind::False,
+					"echo"  => TokenKind::Print,  // echo is an alias for print
 					_       => TokenKind::Id,
 				};
 				tokens.push(Token { kind, value: word, line, col: start_col });
@@ -198,14 +221,15 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				}
 			}
 
-			'+' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Plus,   value: String::from("+"), line, col: c }); }
-			'-' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Minus,  value: String::from("-"), line, col: c }); }
-			'*' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Star,   value: String::from("*"), line, col: c }); }
-			'/' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Slash,  value: String::from("/"), line, col: c }); }
-			'(' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LParen, value: String::from("("), line, col: c }); }
-			')' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RParen, value: String::from(")"), line, col: c }); }
-			'{' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LBrace, value: String::from("{"), line, col: c }); }
-			'}' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RBrace, value: String::from("}"), line, col: c }); }
+			'+' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Plus,      value: String::from("+"), line, col: c }); }
+			'-' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Minus,     value: String::from("-"), line, col: c }); }
+			'*' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Star,      value: String::from("*"), line, col: c }); }
+			'/' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Slash,     value: String::from("/"), line, col: c }); }
+			'(' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LParen,    value: String::from("("), line, col: c }); }
+			')' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RParen,    value: String::from(")"), line, col: c }); }
+			'{' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LBrace,    value: String::from("{"), line, col: c }); }
+			'}' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RBrace,    value: String::from("}"), line, col: c }); }
+			';' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Semicolon, value: String::from(";"), line, col: c }); }
 
 			other => return Err(LangError::new(format!("Unexpected character '{}'", other), line, col)),
 		}
@@ -216,26 +240,35 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 
 // --- TRANSPILER ---
 
+/// Single-pass transpiler that consumes the token list and emits PHP source code.
+/// No AST is built; tokens are consumed and PHP strings are emitted directly.
 struct Transpiler {                                                                                 		//Owns the token list and tracks the current position
 	tokens: Vec<Token>,
 	pos: usize,
 }
 
 impl Transpiler {
+	/// Creates a new `Transpiler` from a token list, with `pos` starting at 0.
 	fn new(tokens: Vec<Token>) -> Self {
 		Transpiler { tokens, pos: 0 }
 	}
 
+	/// Returns a reference to the current token without advancing `pos`.
 	fn peek(&self) -> Option<&Token> {                                                              		//Returns a reference without moving the position
 		self.tokens.get(self.pos)
 	}
 
+	/// Clones and returns the current token, then advances `pos` by one.
+	/// Returns `None` if already past the end of the token list.
 	fn consume(&mut self) -> Option<Token> {																//Returns a Clone of the current token and moves the counter
 		let token = self.tokens.get(self.pos).cloned();
 		self.pos += 1;
 		token
 	}
 
+	/// Consumes the current token and returns it if it matches `kind`.
+	/// If it doesn't match, returns a `LangError` describing what was expected vs. what was found.
+	/// `context` is a short string appended to the error message to clarify where the token was expected.
 	fn expect(&mut self, kind: TokenKind, context: &str) -> Result<Token, LangError> {					// Consumes a token, errors if it isn't the expected kind
 		match self.consume() {
 			Some(t) if t.kind == kind => Ok(t),
@@ -250,6 +283,11 @@ impl Transpiler {
 		}
 	}
 
+	/// Parses the smallest indivisible unit of an expression.
+	///
+	/// Handles: parenthesised groups `(expr)`, unary `!expr`, unary `-expr`,
+	/// variable references (prepends `$`), string literals, and number literals.
+	/// Called by `parse_expr` to get the left-hand side before looking for a binary operator.
 	fn parse_primary(&mut self) -> Result<String, LangError> {												//Parses a single primary: literal, variable, unary op, or grouped expression
 		match self.peek().map(|t| t.kind.clone()) {
 			Some(TokenKind::LParen) => {
@@ -275,10 +313,12 @@ impl Transpiler {
 			Some(TokenKind::String) | Some(TokenKind::Number) => {
 				Ok(self.consume().unwrap().value)
 			}
+			Some(TokenKind::True) => { self.consume(); Ok(String::from("true")) }
+			Some(TokenKind::False) => { self.consume(); Ok(String::from("false")) }
 			Some(_) => {
 				let t = self.peek().unwrap();
 				Err(LangError::new(
-					format!("Unexpected token '{}'  in expression", t.value),
+					format!("Unexpected token '{}' in expression", t.value),
 					t.line, t.col,
 				))
 			}
@@ -286,18 +326,26 @@ impl Transpiler {
 		}
 	}
 
+	/// Maps a binary operator token to its precedence level (1 = loosest, 6 = tightest).
+	/// Returns `None` for any token that is not a binary operator,
+	/// which signals `parse_expr` to stop climbing.
 	fn op_precedence(kind: &TokenKind) -> Option<u8> {														//Basic order of operations
 		match kind {
 			TokenKind::Or                                           				=> Some(1),
 			TokenKind::And                                          				=> Some(2),
 			TokenKind::Eq | TokenKind::NotEq                       					=> Some(3),
-			TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq		        => Some(4),
+			TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq		=> Some(4),
 			TokenKind::Plus | TokenKind::Minus                     					=> Some(5),
 			TokenKind::Star | TokenKind::Slash                     					=> Some(6),
 			_                                                       				=> None,
 		}
 	}
 
+	/// Parses a binary expression using precedence climbing.
+	///
+	/// Calls `parse_primary` for the initial left-hand side, then loops consuming
+	/// binary operators whose precedence is >= `min_prec`. Recursing with `prec + 1`
+	/// enforces left-associativity. Pass `min_prec = 0` to parse a full expression.
 	fn parse_expr(&mut self, min_prec: u8) -> Result<String, LangError> {
 		let mut left = self.parse_primary()?;
 
@@ -318,21 +366,44 @@ impl Transpiler {
 		Ok(left)
 	}
 
-	fn parse_block(&mut self) -> Result<String, LangError> {												// Parses { ... } and returns the inner statements indented
+	/// Parses a brace-delimited block `{ ... }` and returns its contents as indented PHP.
+	///
+	/// `depth` controls the indentation level: each statement inside is prefixed
+	/// with `depth` tabs. Block statements (if/while/for) get a trailing newline
+	/// instead of a semicolon. The surrounding braces are consumed but not included
+	/// in the return value — the caller formats them.
+	fn parse_block(&mut self, depth: usize) -> Result<String, LangError> {									// Parses { ... } and returns the inner statements indented
+		let indent = "\t".repeat(depth);
 		self.expect(TokenKind::LBrace, "to open block")?;
 		let mut body = String::new();
 		while let Some(t) = self.peek() {
 			if t.kind == TokenKind::RBrace { break; }
-			let stmt = self.statement()?;
+			let stmt = self.statement(depth)?;
 			if !stmt.is_empty() {
-				body.push_str(&format!("\t{};\n", stmt));
+				let is_block_stmt = stmt.starts_with("if")
+					|| stmt.starts_with("while")
+					|| stmt.starts_with("for");
+				if is_block_stmt {
+					body.push_str(&format!("{}{}\n", indent, stmt));
+				} else {
+					body.push_str(&format!("{}{};\n", indent, stmt));
+				}
 			}
 		}
 		self.expect(TokenKind::RBrace, "to close block")?;
 		Ok(body)
 	}
 
-	fn statement(&mut self) -> Result<String, LangError> {													//for now, only two statements, Let and Print
+	/// Parses and emits a single top-level statement.
+	///
+	/// Dispatches on the current token kind:
+	/// - `let x = expr`  → variable declaration
+	/// - `x = expr`      → variable reassignment
+	/// - `print expr`    → echo statement
+	/// - `if / while / for` → control flow (calls `parse_block` for bodies)
+	///
+	/// `depth` is passed through to `parse_block` for correct indentation.
+	fn statement(&mut self, depth: usize) -> Result<String, LangError> {									//for now, only two statements, Let and Print
 		match self.peek().map(|t| t.kind.clone()) {
 			Some(TokenKind::Let) => {																		//expects an ID token, an Assign token and an Expression
 				self.consume();
@@ -353,20 +424,49 @@ impl Transpiler {
 				let expr = self.parse_expr(0)?;
 				Ok(format!("echo {}", expr))
 			}
-			Some(TokenKind::If) => {																		// if (cond) { ... } else { ... }
+			Some(TokenKind::If) => {																// if (cond) { ... } else { ... }
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'if'")?;
 				let cond = self.parse_expr(0)?;
 				self.expect(TokenKind::RParen, "to close 'if' condition")?;
-				let if_body = self.parse_block()?;
+				let indent = "\t".repeat(depth);
+				let if_body = self.parse_block(depth + 1)?;
 				let else_part = if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Else) {
 					self.consume();
-					let else_body = self.parse_block()?;
-					format!(" else {{\n{}}}", else_body)
+					let else_body = self.parse_block(depth + 1)?;
+					format!(" else {{\n{}{}}}", else_body, indent)
 				} else {
 					String::new()
 				};
-				Ok(format!("if ({}) {{\n{}}}{}", cond, if_body, else_part))
+				Ok(format!("if ({}) {{\n{}{}}}{}", cond, if_body, indent, else_part))
+			}
+			Some(TokenKind::While) => {																// while (cond) { ... }
+				self.consume();
+				self.expect(TokenKind::LParen, "after 'while'")?;
+				let cond = self.parse_expr(0)?;
+				self.expect(TokenKind::RParen, "to close 'while' condition")?;
+				let indent = "\t".repeat(depth);
+				let body = self.parse_block(depth + 1)?;
+				Ok(format!("while ({}) {{\n{}{}}}", cond, body, indent))
+			}
+			Some(TokenKind::Id) => {																		// bare assignment: x = expr
+				let name_tok = self.consume().unwrap();
+				self.expect(TokenKind::Assign, "in assignment")?;
+				let expr = self.parse_expr(0)?;
+				Ok(format!("${} = {}", name_tok.value, expr))
+			}
+			Some(TokenKind::For) => {																// for (init; cond; step) { ... }
+				self.consume();
+				self.expect(TokenKind::LParen, "after 'for'")?;
+				let init = self.parse_for_clause()?;
+				self.expect(TokenKind::Semicolon, "after 'for' init")?;
+				let cond = self.parse_expr(0)?;
+				self.expect(TokenKind::Semicolon, "after 'for' condition")?;
+				let step = self.parse_for_clause()?;
+				self.expect(TokenKind::RParen, "to close 'for' header")?;
+				let indent = "\t".repeat(depth);
+				let body = self.parse_block(depth + 1)?;
+				Ok(format!("for ({}; {}; {}) {{\n{}{}}}", init, cond, step, body, indent))
 			}
 			Some(_) => {
 				let t = self.peek().unwrap();
@@ -379,13 +479,55 @@ impl Transpiler {
 		}
 	}
 
+	/// Parses the init or step clause inside a `for (init; cond; step)` header.
+	///
+	/// Looks one token ahead to distinguish three cases without consuming prematurely:
+	/// - `let x = expr`  → fresh variable declaration
+	/// - `x = expr`      → reassignment of an existing variable
+	/// - anything else   → treated as a plain expression
+	fn parse_for_clause(&mut self) -> Result<String, LangError> {											// Parses the init or step clause of a for loop (let assignment, bare assignment, or expression)
+		let is_let = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Let);
+		let is_bare_assign = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Id)
+			&& self.tokens.get(self.pos + 1).map(|t| t.kind.clone()) == Some(TokenKind::Assign);
+
+		if is_let {
+			self.consume();
+			let name_tok = match self.consume() {
+				Some(t) if t.kind == TokenKind::Id => t,
+				Some(t) => return Err(LangError::new(
+					format!("Expected variable name in 'for' clause, got '{}'", t.value),
+					t.line, t.col,
+				)),
+				None => return Err(LangError::new("Expected variable name in 'for' clause, got end of file", 0, 0)),
+			};
+			self.expect(TokenKind::Assign, "in 'for' clause")?;
+			let expr = self.parse_expr(0)?;
+			Ok(format!("${} = {}", name_tok.value, expr))
+		} else if is_bare_assign {
+			let name_tok = self.consume().unwrap();
+			self.consume();
+			let expr = self.parse_expr(0)?;
+			Ok(format!("${} = {}", name_tok.value, expr))
+		} else {
+			self.parse_expr(0)
+		}
+	}
+
+	/// Drives the full transpilation pass and returns the complete PHP output string.
+	///
+	/// Prepends the PHP opening tag, then calls `statement` in a loop until all
+	/// tokens are consumed. Block statements (if/while/for) get a trailing newline;
+	/// all other statements get a semicolon and newline.
 	fn transpile(&mut self) -> Result<String, LangError> {
 		let mut output = String::from("<?php\n\n");												//starts PHP
 		while self.pos < self.tokens.len() {
-			let stmt = self.statement()?;														//calls statement() until there's no more tokens left
+			let stmt = self.statement(0)?;														//calls statement() until there's no more tokens left
 			if !stmt.is_empty() {
+				let is_block_stmt = stmt.starts_with("if")
+					|| stmt.starts_with("while")
+					|| stmt.starts_with("for");
 				output.push_str(&stmt);
-				if stmt.starts_with("if") {
+				if is_block_stmt {
 					output.push('\n');
 				} else {
 					output.push_str(";\n");
@@ -398,6 +540,8 @@ impl Transpiler {
 
 // --- MAIN ---
 
+/// Entry point. Reads a `.ez` source file, runs the lexer and transpiler,
+/// and writes the resulting PHP to a `.php` file with the same base name.
 fn main() {
 	let args: Vec<String> = env::args().collect();
 	if args.len() < 2 {
