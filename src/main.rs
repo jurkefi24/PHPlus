@@ -36,13 +36,17 @@ enum TokenKind {
 	Else,           // else keyword
 	While,          // while keyword
 	For,            // for keyword
+	Class,          // class keyword
+	New,            // new keyword
+	Fn,             // fn keyword
 	Semicolon,      // ; used as separator in for loops
 
 	// data types
 	String,
 	Number,
 
-	Id, // variable name
+	Id,     // variable name
+	Self_,  // self keyword, becomes $this in PHP
 	Assign, // assigns value to a variable ( = )
 
 	// math
@@ -67,6 +71,9 @@ enum TokenKind {
 	RBrace, // }
 	True,   // true
 	False,  // false
+	Dot,    // . property access
+	Comma,  // , parameter separator
+	Private, // private keyword
 }
 
 /// A single lexical unit produced by the lexer.
@@ -141,16 +148,21 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 					else { break; }
 				}
 				let kind = match word.as_str() {
-					"print" => TokenKind::Print,
-					"let"   => TokenKind::Let,
-					"if"    => TokenKind::If,
-					"else"  => TokenKind::Else,
-					"while" => TokenKind::While,
-					"for"   => TokenKind::For,
-					"true"  => TokenKind::True,
-					"false" => TokenKind::False,
-					"echo"  => TokenKind::Print,  // echo is an alias for print
-					_       => TokenKind::Id,
+					"print"   => TokenKind::Print,
+					"let"     => TokenKind::Let,
+					"if"      => TokenKind::If,
+					"else"    => TokenKind::Else,
+					"while"   => TokenKind::While,
+					"for"     => TokenKind::For,
+					"true"    => TokenKind::True,
+					"false"   => TokenKind::False,
+					"echo"    => TokenKind::Print,   // echo is an alias for print
+					"class"   => TokenKind::Class,
+					"new"     => TokenKind::New,
+					"fn"      => TokenKind::Fn,
+					"self"    => TokenKind::Self_,
+					"private" => TokenKind::Private,
+					_         => TokenKind::Id,
 				};
 				tokens.push(Token { kind, value: word, line, col: start_col });
 			}
@@ -221,6 +233,8 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				}
 			}
 
+			'.' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Dot,       value: String::from("."), line, col: c }); }
+			',' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Comma,     value: String::from(","), line, col: c }); }
 			'+' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Plus,      value: String::from("+"), line, col: c }); }
 			'-' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Minus,     value: String::from("-"), line, col: c }); }
 			'*' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Star,      value: String::from("*"), line, col: c }); }
@@ -286,7 +300,9 @@ impl Transpiler {
 	/// Parses the smallest indivisible unit of an expression.
 	///
 	/// Handles: parenthesised groups `(expr)`, unary `!expr`, unary `-expr`,
-	/// variable references (prepends `$`), string literals, and number literals.
+	/// variable references (prepends `$`), `self` (becomes `$this`),
+	/// string literals, number literals, boolean literals,
+	/// and `new ClassName()` instantiation.
 	/// Called by `parse_expr` to get the left-hand side before looking for a binary operator.
 	fn parse_primary(&mut self) -> Result<String, LangError> {												//Parses a single primary: literal, variable, unary op, or grouped expression
 		match self.peek().map(|t| t.kind.clone()) {
@@ -306,15 +322,35 @@ impl Transpiler {
 				let operand = self.parse_primary()?;
 				Ok(format!("-{}", operand))
 			}
+			Some(TokenKind::Self_) => {																		// self.attr becomes $this->attr
+				self.consume();
+				self.parse_postfix(String::from("$this"))
+			}
 			Some(TokenKind::Id) => {																		//Adds the $ before a variable
 				let t = self.consume().unwrap();
-				Ok(format!("${}", t.value))
+				let base = format!("${}", t.value);
+				self.parse_postfix(base)
 			}
 			Some(TokenKind::String) | Some(TokenKind::Number) => {
 				Ok(self.consume().unwrap().value)
 			}
-			Some(TokenKind::True) => { self.consume(); Ok(String::from("true")) }
+			Some(TokenKind::True)  => { self.consume(); Ok(String::from("true"))  }
 			Some(TokenKind::False) => { self.consume(); Ok(String::from("false")) }
+			Some(TokenKind::New)   => {																		// new ClassName() instantiation
+				let tok = self.consume().unwrap();
+				let class_name = match self.consume() {
+					Some(t) if t.kind == TokenKind::Id => t.value,
+					Some(t) => return Err(LangError::new(
+						format!("Expected class name after 'new', got '{}'", t.value),
+						t.line, t.col,
+					)),
+					None => return Err(LangError::new("Expected class name after 'new'", tok.line, tok.col)),
+				};
+				self.expect(TokenKind::LParen, "after class name in 'new'")?;
+				self.expect(TokenKind::RParen, "to close 'new' argument list")?;
+				let base = format!("new {}()", class_name);
+				self.parse_postfix(base)
+			}
 			Some(_) => {
 				let t = self.peek().unwrap();
 				Err(LangError::new(
@@ -324,6 +360,39 @@ impl Transpiler {
 			}
 			None => Err(LangError::new("Unexpected end of file in expression", 0, 0)),
 		}
+	}
+
+	/// Parses a postfix property access chain: `expr.attr` or `expr.attr.attr2`.
+	///
+	/// Called after `parse_primary` to consume any number of `.attr` suffixes.
+	/// Translates `obj.attr` to `$obj->attr` in PHP. Chains left-to-right.
+	fn parse_postfix(&mut self, mut left: String) -> Result<String, LangError> {
+		while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Dot) {
+			let dot_tok = self.consume().unwrap();
+			let attr = match self.consume() {
+				Some(t) if t.kind == TokenKind::Id => t.value,
+				Some(t) => return Err(LangError::new(
+					format!("Expected attribute name after '.', got '{}'", t.value),
+					t.line, t.col,
+				)),
+				None => return Err(LangError::new("Expected attribute name after '.'", dot_tok.line, dot_tok.col)),
+			};
+			if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
+				self.consume();
+				let mut args: Vec<String> = Vec::new();
+				while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+					if !args.is_empty() {
+						self.expect(TokenKind::Comma, "between method arguments")?;
+					}
+					args.push(self.parse_expr(0)?);
+				}
+				self.expect(TokenKind::RParen, "to close method call")?;
+				left = format!("{}->{}({})", left, attr, args.join(", "));
+			} else {
+				left = format!("{}->{}", left, attr);
+			}
+		}
+		Ok(left)
 	}
 
 	/// Maps a binary operator token to its precedence level (1 = loosest, 6 = tightest).
@@ -369,10 +438,10 @@ impl Transpiler {
 	/// Parses a brace-delimited block `{ ... }` and returns its contents as indented PHP.
 	///
 	/// `depth` controls the indentation level: each statement inside is prefixed
-	/// with `depth` tabs. Block statements (if/while/for) get a trailing newline
+	/// with `depth` tabs. Block statements (if/while/for/class) get a trailing newline
 	/// instead of a semicolon. The surrounding braces are consumed but not included
 	/// in the return value — the caller formats them.
-	fn parse_block(&mut self, depth: usize) -> Result<String, LangError> {									// Parses { ... } and returns the inner statements indented
+	fn parse_block(&mut self, depth: usize) -> Result<String, LangError> {								// Parses { ... } and returns the inner statements indented
 		let indent = "\t".repeat(depth);
 		self.expect(TokenKind::LBrace, "to open block")?;
 		let mut body = String::new();
@@ -382,7 +451,8 @@ impl Transpiler {
 			if !stmt.is_empty() {
 				let is_block_stmt = stmt.starts_with("if")
 					|| stmt.starts_with("while")
-					|| stmt.starts_with("for");
+					|| stmt.starts_with("for")
+					|| stmt.starts_with("class");
 				if is_block_stmt {
 					body.push_str(&format!("{}{}\n", indent, stmt));
 				} else {
@@ -394,18 +464,21 @@ impl Transpiler {
 		Ok(body)
 	}
 
-	/// Parses and emits a single top-level statement.
+	/// Parses and emits a single statement.
 	///
 	/// Dispatches on the current token kind:
-	/// - `let x = expr`  → variable declaration
-	/// - `x = expr`      → variable reassignment
-	/// - `print expr`    → echo statement
-	/// - `if / while / for` → control flow (calls `parse_block` for bodies)
+	/// - `let x = expr`          → variable declaration
+	/// - `x = expr`              → variable reassignment
+	/// - `x.attr = expr`         → property assignment
+	/// - `self.attr = expr`      → self property assignment (becomes `$this->attr`)
+	/// - `print expr`            → echo statement
+	/// - `class Name { ... }`    → class definition with properties and methods
+	/// - `if / while / for`      → control flow (calls `parse_block` for bodies)
 	///
 	/// `depth` is passed through to `parse_block` for correct indentation.
-	fn statement(&mut self, depth: usize) -> Result<String, LangError> {									//for now, only two statements, Let and Print
+	fn statement(&mut self, depth: usize) -> Result<String, LangError> {								//for now, only two statements, Let and Print
 		match self.peek().map(|t| t.kind.clone()) {
-			Some(TokenKind::Let) => {																		//expects an ID token, an Assign token and an Expression
+			Some(TokenKind::Let) => {																	//expects an ID token, an Assign token and an Expression
 				self.consume();
 				let name_tok = match self.consume() {
 					Some(t) if t.kind == TokenKind::Id => t,
@@ -419,12 +492,12 @@ impl Transpiler {
 				let expr = self.parse_expr(0)?;
 				Ok(format!("${} = {}", name_tok.value, expr))
 			}
-			Some(TokenKind::Print) => {																		//prints the expression after it
+			Some(TokenKind::Print) => {																	//prints the expression after it
 				self.consume();
 				let expr = self.parse_expr(0)?;
 				Ok(format!("echo {}", expr))
 			}
-			Some(TokenKind::If) => {																// if (cond) { ... } else { ... }
+			Some(TokenKind::If) => {																	// if (cond) { ... } else { ... }
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'if'")?;
 				let cond = self.parse_expr(0)?;
@@ -440,7 +513,7 @@ impl Transpiler {
 				};
 				Ok(format!("if ({}) {{\n{}{}}}{}", cond, if_body, indent, else_part))
 			}
-			Some(TokenKind::While) => {																// while (cond) { ... }
+			Some(TokenKind::While) => {																	// while (cond) { ... }
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'while'")?;
 				let cond = self.parse_expr(0)?;
@@ -449,13 +522,7 @@ impl Transpiler {
 				let body = self.parse_block(depth + 1)?;
 				Ok(format!("while ({}) {{\n{}{}}}", cond, body, indent))
 			}
-			Some(TokenKind::Id) => {																		// bare assignment: x = expr
-				let name_tok = self.consume().unwrap();
-				self.expect(TokenKind::Assign, "in assignment")?;
-				let expr = self.parse_expr(0)?;
-				Ok(format!("${} = {}", name_tok.value, expr))
-			}
-			Some(TokenKind::For) => {																// for (init; cond; step) { ... }
+			Some(TokenKind::For) => {																	// for (init; cond; step) { ... }
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'for'")?;
 				let init = self.parse_for_clause()?;
@@ -467,6 +534,107 @@ impl Transpiler {
 				let indent = "\t".repeat(depth);
 				let body = self.parse_block(depth + 1)?;
 				Ok(format!("for ({}; {}; {}) {{\n{}{}}}", init, cond, step, body, indent))
+			}
+			Some(TokenKind::Class) => {																	// class Name { let prop = val ... fn method(params) { ... } }
+				let class_tok = self.consume().unwrap();
+				let class_name = match self.consume() {
+					Some(t) if t.kind == TokenKind::Id => t.value,
+					Some(t) => return Err(LangError::new(
+						format!("Expected class name after 'class', got '{}'", t.value),
+						t.line, t.col,
+					)),
+					None => return Err(LangError::new("Expected class name after 'class'", class_tok.line, class_tok.col)),
+				};
+				self.expect(TokenKind::LBrace, "to open class body")?;
+				let mut body = String::new();
+				while let Some(t) = self.peek() {
+					if t.kind == TokenKind::RBrace { break; }
+					match self.peek().map(|t| t.kind.clone()) {
+						Some(TokenKind::Fn) => {														// method: fn name(params) { ... }
+							self.consume();
+							let method_tok = match self.consume() {
+								Some(t) if t.kind == TokenKind::Id => t,
+								Some(t) => return Err(LangError::new(
+									format!("Expected method name after 'fn', got '{}'", t.value),
+									t.line, t.col,
+								)),
+								None => return Err(LangError::new("Expected method name after 'fn'", 0, 0)),
+							};
+							self.expect(TokenKind::LParen, "after method name")?;
+							let mut params: Vec<String> = Vec::new();
+							while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+								if !params.is_empty() {
+									self.expect(TokenKind::Comma, "between method parameters")?;
+								}
+								let param = match self.consume() {
+									Some(t) if t.kind == TokenKind::Id => t.value,
+									Some(t) => return Err(LangError::new(
+										format!("Expected parameter name, got '{}'", t.value),
+										t.line, t.col,
+									)),
+									None => return Err(LangError::new("Expected parameter name, got end of file", 0, 0)),
+								};
+								params.push(format!("${}", param));
+							}
+							self.expect(TokenKind::RParen, "to close method parameter list")?;
+							let param_str = params.join(", ");
+							let method_body = self.parse_block(2)?;
+							body.push_str(&format!("\tpublic function {}({}) {{\n{}\t}}\n", method_tok.value, param_str, method_body));
+						}
+						Some(TokenKind::Private) | Some(TokenKind::Let) => {						// property: [private] let name = val
+							let visibility = if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Private) {
+								self.consume();
+								"private"
+							} else {
+								"public"
+							};
+							self.expect(TokenKind::Let, "after visibility modifier")?;
+							let prop_tok = match self.consume() {
+								Some(t) if t.kind == TokenKind::Id => t,
+								Some(t) => return Err(LangError::new(
+									format!("Expected property name in class body, got '{}'", t.value),
+									t.line, t.col,
+								)),
+								None => return Err(LangError::new("Expected property name in class body", 0, 0)),
+							};
+							self.expect(TokenKind::Assign, "after property name in class body")?;
+							let val = self.parse_expr(0)?;
+							body.push_str(&format!("\t{} ${} = {};\n", visibility, prop_tok.value, val));
+						}
+						_ => {
+							let t = self.peek().unwrap();
+							return Err(LangError::new(
+								format!("Expected 'let' or 'fn' in class body, got '{}'", t.value),
+								t.line, t.col,
+							));
+						}
+					}
+				}
+				self.expect(TokenKind::RBrace, "to close class body")?;
+				Ok(format!("class {} {{\n{}}}", class_name, body))
+			}
+			Some(TokenKind::Self_) | Some(TokenKind::Id) => {											// bare assignment: x = expr, obj.attr = expr, or self.attr = expr
+				let name_tok = self.consume().unwrap();
+				let mut lhs = if name_tok.kind == TokenKind::Self_ {
+					String::from("$this")
+				} else {
+					format!("${}", name_tok.value)
+				};
+				while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Dot) {
+					let dot_tok = self.consume().unwrap();
+					let attr = match self.consume() {
+						Some(t) if t.kind == TokenKind::Id => t.value,
+						Some(t) => return Err(LangError::new(
+							format!("Expected attribute name after '.', got '{}'", t.value),
+							t.line, t.col,
+						)),
+						None => return Err(LangError::new("Expected attribute name after '.'", dot_tok.line, dot_tok.col)),
+					};
+					lhs = format!("{}->{}", lhs, attr);
+				}
+				self.expect(TokenKind::Assign, "in assignment")?;
+				let expr = self.parse_expr(0)?;
+				Ok(format!("{} = {}", lhs, expr))
 			}
 			Some(_) => {
 				let t = self.peek().unwrap();
@@ -485,7 +653,7 @@ impl Transpiler {
 	/// - `let x = expr`  → fresh variable declaration
 	/// - `x = expr`      → reassignment of an existing variable
 	/// - anything else   → treated as a plain expression
-	fn parse_for_clause(&mut self) -> Result<String, LangError> {											// Parses the init or step clause of a for loop (let assignment, bare assignment, or expression)
+	fn parse_for_clause(&mut self) -> Result<String, LangError> {										// Parses the init or step clause of a for loop (let assignment, bare assignment, or expression)
 		let is_let = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Let);
 		let is_bare_assign = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Id)
 			&& self.tokens.get(self.pos + 1).map(|t| t.kind.clone()) == Some(TokenKind::Assign);
@@ -516,7 +684,7 @@ impl Transpiler {
 	/// Drives the full transpilation pass and returns the complete PHP output string.
 	///
 	/// Prepends the PHP opening tag, then calls `statement` in a loop until all
-	/// tokens are consumed. Block statements (if/while/for) get a trailing newline;
+	/// tokens are consumed. Block statements (if/while/for/class) get a trailing newline;
 	/// all other statements get a semicolon and newline.
 	fn transpile(&mut self) -> Result<String, LangError> {
 		let mut output = String::from("<?php\n\n");												//starts PHP
@@ -525,7 +693,8 @@ impl Transpiler {
 			if !stmt.is_empty() {
 				let is_block_stmt = stmt.starts_with("if")
 					|| stmt.starts_with("while")
-					|| stmt.starts_with("for");
+					|| stmt.starts_with("for")
+					|| stmt.starts_with("class");
 				output.push_str(&stmt);
 				if is_block_stmt {
 					output.push('\n');
