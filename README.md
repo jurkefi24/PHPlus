@@ -15,7 +15,8 @@ I'd like this to be a less brainnumbingly stupid version of PHP\
 ### CURRENTLY
 let and print\
 statements like if, for or while\
+better OOP implementation (no `$object->attribute`, but `object.attribute`)\
 
 ### FUTURE
 hopefully strict typing (at least before compile)\
-better OOP implementation (no `$object->attribute`, but `object.attribute`)
+
