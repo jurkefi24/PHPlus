@@ -328,8 +328,22 @@ impl Transpiler {
 			}
 			Some(TokenKind::Id) => {																		//Adds the $ before a variable
 				let t = self.consume().unwrap();
-				let base = format!("${}", t.value);
-				self.parse_postfix(base)
+				if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
+					self.consume();
+					let mut args: Vec<String> = Vec::new();
+					while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+						if !args.is_empty() {
+							self.expect(TokenKind::Comma, "between function arguments")?;
+						}
+						args.push(self.parse_expr(0)?);
+					}
+					self.expect(TokenKind::RParen, "to close function call")?;
+					let base = format!("{}({})", t.value, args.join(", "));
+					self.parse_postfix(base)
+				} else {
+					let base = format!("${}", t.value);
+					self.parse_postfix(base)
+				}
 			}
 			Some(TokenKind::String) | Some(TokenKind::Number) => {
 				Ok(self.consume().unwrap().value)
@@ -452,7 +466,8 @@ impl Transpiler {
 				let is_block_stmt = stmt.starts_with("if")
 					|| stmt.starts_with("while")
 					|| stmt.starts_with("for")
-					|| stmt.starts_with("class");
+					|| stmt.starts_with("class")
+					|| stmt.starts_with("function");
 				if is_block_stmt {
 					body.push_str(&format!("{}{}\n", indent, stmt));
 				} else {
@@ -473,7 +488,8 @@ impl Transpiler {
 	/// - `self.attr = expr`      → self property assignment (becomes `$this->attr`)
 	/// - `print expr`            → echo statement
 	/// - `class Name { ... }`    → class definition with properties and methods
-	/// - `if / while / for`      → control flow (calls `parse_block` for bodies)
+	/// - `fn name(params) { ... }` → top-level function definition
+	/// - `if / while / for`        → control flow (calls `parse_block` for bodies)
 	///
 	/// `depth` is passed through to `parse_block` for correct indentation.
 	fn statement(&mut self, depth: usize) -> Result<String, LangError> {								//for now, only two statements, Let and Print
@@ -534,6 +550,38 @@ impl Transpiler {
 				let indent = "\t".repeat(depth);
 				let body = self.parse_block(depth + 1)?;
 				Ok(format!("for ({}; {}; {}) {{\n{}{}}}", init, cond, step, body, indent))
+			}
+			Some(TokenKind::Fn) => {																		// fn name(params) { ... } top-level function
+				let fn_tok = self.consume().unwrap();
+				let fn_name = match self.consume() {
+					Some(t) if t.kind == TokenKind::Id => t.value,
+					Some(t) => return Err(LangError::new(
+						format!("Expected function name after 'fn', got '{}'", t.value),
+						t.line, t.col,
+					)),
+					None => return Err(LangError::new("Expected function name after 'fn'", fn_tok.line, fn_tok.col)),
+				};
+				self.expect(TokenKind::LParen, "after function name")?;
+				let mut params: Vec<String> = Vec::new();
+				while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+					if !params.is_empty() {
+						self.expect(TokenKind::Comma, "between function parameters")?;
+					}
+					let param = match self.consume() {
+						Some(t) if t.kind == TokenKind::Id => t.value,
+						Some(t) => return Err(LangError::new(
+							format!("Expected parameter name, got '{}'", t.value),
+							t.line, t.col,
+						)),
+						None => return Err(LangError::new("Expected parameter name, got end of file", 0, 0)),
+					};
+					params.push(format!("${}", param));
+				}
+				self.expect(TokenKind::RParen, "to close function parameter list")?;
+				let param_str = params.join(", ");
+				let indent = "\t".repeat(depth);
+				let body = self.parse_block(depth + 1)?;
+				Ok(format!("function {}({}) {{\n{}{}}}", fn_name, param_str, body, indent))
 			}
 			Some(TokenKind::Class) => {																	// class Name { let prop = val ... fn method(params) { ... } }
 				let class_tok = self.consume().unwrap();
@@ -613,8 +661,21 @@ impl Transpiler {
 				self.expect(TokenKind::RBrace, "to close class body")?;
 				Ok(format!("class {} {{\n{}}}", class_name, body))
 			}
-			Some(TokenKind::Self_) | Some(TokenKind::Id) => {											// bare assignment: x = expr, obj.attr = expr, or self.attr = expr
+			Some(TokenKind::Self_) | Some(TokenKind::Id) => {											// bare assignment, method call, or bare function call
 				let name_tok = self.consume().unwrap();
+				// bare function call: foo(args)
+				if name_tok.kind == TokenKind::Id && self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
+					self.consume();
+					let mut args: Vec<String> = Vec::new();
+					while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+						if !args.is_empty() {
+							self.expect(TokenKind::Comma, "between function arguments")?;
+						}
+						args.push(self.parse_expr(0)?);
+					}
+					self.expect(TokenKind::RParen, "to close function call")?;
+					return Ok(format!("{}({})", name_tok.value, args.join(", ")));
+				}
 				let mut lhs = if name_tok.kind == TokenKind::Self_ {
 					String::from("$this")
 				} else {
@@ -630,11 +691,33 @@ impl Transpiler {
 						)),
 						None => return Err(LangError::new("Expected attribute name after '.'", dot_tok.line, dot_tok.col)),
 					};
-					lhs = format!("{}->{}", lhs, attr);
+					if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
+						self.consume();
+						let mut args: Vec<String> = Vec::new();
+						while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
+							if !args.is_empty() {
+								self.expect(TokenKind::Comma, "between method arguments")?;
+							}
+							args.push(self.parse_expr(0)?);
+						}
+						self.expect(TokenKind::RParen, "to close method call")?;
+						lhs = format!("{}->{}({})", lhs, attr, args.join(", "));
+					} else {
+						lhs = format!("{}->{}", lhs, attr);
+					}
 				}
-				self.expect(TokenKind::Assign, "in assignment")?;
-				let expr = self.parse_expr(0)?;
-				Ok(format!("{} = {}", lhs, expr))
+				if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Assign) {
+					self.consume();
+					let expr = self.parse_expr(0)?;
+					Ok(format!("{} = {}", lhs, expr))
+				} else if lhs.contains("->") && lhs.ends_with(")") {
+					Ok(lhs) // standalone method call statement
+				} else {
+					let t = self.peek();
+					let (tline, tcol) = t.map(|t| (t.line, t.col)).unwrap_or((0, 0));
+					let got = t.map(|t| t.value.clone()).unwrap_or_else(|| String::from("end of file"));
+					Err(LangError::new(format!("Expected '=' in assignment, got '{}'", got), tline, tcol))
+				}
 			}
 			Some(_) => {
 				let t = self.peek().unwrap();
@@ -694,7 +777,8 @@ impl Transpiler {
 				let is_block_stmt = stmt.starts_with("if")
 					|| stmt.starts_with("while")
 					|| stmt.starts_with("for")
-					|| stmt.starts_with("class");
+					|| stmt.starts_with("class")
+					|| stmt.starts_with("function");
 				output.push_str(&stmt);
 				if is_block_stmt {
 					output.push('\n');
