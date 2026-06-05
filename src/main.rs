@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::fmt;
+use std::collections::HashMap;
 
 // --- ERROR TYPE ---
 
@@ -368,12 +369,13 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 struct Transpiler {                                                                                 		//Owns the token list and tracks the current position
 	tokens: Vec<Token>,
 	pos: usize,
+	symbols: HashMap<String, String>, // variable name -> declared type
 }
 
 impl Transpiler {
 	/// Creates a new `Transpiler` from a token list, with `pos` starting at 0.
 	fn new(tokens: Vec<Token>) -> Self {
-		Transpiler { tokens, pos: 0 }
+		Transpiler { tokens, pos: 0, symbols: HashMap::new() }
 	}
 
 	/// Returns a reference to the current token without advancing `pos`.
@@ -404,6 +406,36 @@ impl Transpiler {
 				0, 0,
 			)),
 		}
+	}
+
+	/// Infers the concrete type of a PHP literal expression string.
+	/// Only handles values that are unambiguously a single type.
+	/// Returns `None` for anything that requires runtime information (variables, expressions).
+	fn infer_literal_type(expr: &str) -> Option<&'static str> {
+		let e = expr.trim();
+		if e == "true" || e == "false"                        { return Some("bool");   }
+		if e == "null"                                        { return Some("null");   }
+		if (e.starts_with('"') && e.ends_with('"'))
+			|| (e.starts_with('\'') && e.ends_with('\''))   { return Some("string"); }
+		if e.starts_with("0x") || e.starts_with("0X")
+			|| e.starts_with("0o") || e.starts_with("0O")
+			|| e.starts_with("0b") || e.starts_with("0B")     { return Some("int");    }
+		if e.contains('.') || e.contains('e') || e.contains('E') {
+			if e.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+				return Some("float");
+			}
+		}
+		if e.chars().all(|c| c.is_ascii_digit())              { return Some("int");    }
+		if e.starts_with('-') && e[1..].chars().all(|c| c.is_ascii_digit()) { return Some("int"); }
+		None
+	}
+
+	/// Checks whether a concrete type satisfies a declared type annotation.
+	/// Handles union types (e.g. `int|string`) and the `mixed` wildcard.
+	/// A declared type of `None` (unannotated) always passes.
+	fn type_compatible(declared: &str, actual: &str) -> bool {
+		if declared == "mixed" { return true; }
+		declared.split('|').any(|part| part.trim() == actual)
 	}
 
 	/// Tries to parse an optional type annotation (`: type`) after a variable name or parameter.
@@ -733,9 +765,36 @@ impl Transpiler {
 				let type_ann = self.try_parse_type()?;
 				self.expect(TokenKind::Assign, "after variable name")?;
 				let expr = self.parse_expr(0)?;
-				match type_ann {
-					Some(ty) => Ok(format!("${} = ({}) {}", name_tok.value, ty, expr)),
-					None     => Ok(format!("${} = {}", name_tok.value, expr)),
+				if let Some(ref ty) = type_ann {
+					// check literal type against declared type
+					if let Some(actual) = Self::infer_literal_type(&expr) {
+						if !Self::type_compatible(ty, actual) {
+							return Err(LangError::new(
+								format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, name_tok.value, ty),
+								name_tok.line, name_tok.col,
+							));
+						}
+					}
+					// check variable type against declared type
+					if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
+						let src_name = expr.trim_start_matches('$');
+						if let Some(src_type) = self.symbols.get(src_name).cloned() {
+							if !Self::type_compatible(ty, &src_type) {
+								return Err(LangError::new(
+									format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", src_type, name_tok.value, ty),
+									name_tok.line, name_tok.col,
+								));
+							}
+						}
+					}
+					self.symbols.insert(name_tok.value.clone(), ty.clone());
+					Ok(format!("${} = ({}) {}", name_tok.value, ty, expr))
+				} else {
+					// no type annotation — infer from literal and store if possible
+					if let Some(inferred) = Self::infer_literal_type(&expr) {
+						self.symbols.insert(name_tok.value.clone(), inferred.to_string());
+					}
+					Ok(format!("${} = {}", name_tok.value, expr))
 				}
 			}
 			Some(TokenKind::Print) => {																	//prints the expression after it
@@ -953,6 +1012,31 @@ impl Transpiler {
 				if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Assign) {
 					self.consume();
 					let expr = self.parse_expr(0)?;
+					// type check bare variable reassignment against symbol table
+					if lhs.starts_with('$') && !lhs.contains("->") && !lhs.contains('[') {
+						let var_name = lhs.trim_start_matches('$');
+						if let Some(declared) = self.symbols.get(var_name).cloned() {
+							if let Some(actual) = Self::infer_literal_type(&expr) {
+								if !Self::type_compatible(&declared, actual) {
+									return Err(LangError::new(
+										format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, var_name, declared),
+										name_tok.line, name_tok.col,
+									));
+								}
+							}
+							if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
+								let src_name = expr.trim_start_matches('$');
+								if let Some(src_type) = self.symbols.get(src_name).cloned() {
+									if !Self::type_compatible(&declared, &src_type) {
+										return Err(LangError::new(
+											format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", src_type, var_name, declared),
+											name_tok.line, name_tok.col,
+										));
+									}
+								}
+							}
+						}
+					}
 					Ok(format!("{} = {}", lhs, expr))
 				} else if lhs.contains("->") && lhs.ends_with(")") {
 					Ok(lhs) // standalone method call statement
