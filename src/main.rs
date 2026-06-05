@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::fmt;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 // --- ERROR TYPE ---
 
@@ -370,12 +371,13 @@ struct Transpiler {                                                             
 	tokens: Vec<Token>,
 	pos: usize,
 	symbols: HashMap<String, String>, // variable name -> declared type
+	classes: HashSet<String>,          // declared class names
 }
 
 impl Transpiler {
 	/// Creates a new `Transpiler` from a token list, with `pos` starting at 0.
 	fn new(tokens: Vec<Token>) -> Self {
-		Transpiler { tokens, pos: 0, symbols: HashMap::new() }
+		Transpiler { tokens, pos: 0, symbols: HashMap::new(), classes: HashSet::new() }
 	}
 
 	/// Returns a reference to the current token without advancing `pos`.
@@ -430,6 +432,45 @@ impl Transpiler {
 		None
 	}
 
+	/// Infers the type of an expression that may include `new ClassName()`.
+	/// Extends `infer_literal_type` with class instantiation recognition.
+	/// Returns `None` for anything unresolvable at compile time.
+	fn infer_expr_type(&self, expr: &str) -> Option<String> {
+		if let Some(lit) = Self::infer_literal_type(expr) {
+			return Some(lit.to_string());
+		}
+		let e = expr.trim();
+		if e.starts_with("new ") && e.ends_with("()") {
+			let class_name = e["new ".len()..e.len() - 2].trim();
+			return Some(class_name.to_string());
+		}
+		None
+	}
+
+	/// Validates a `new ClassName()` expression: checks the class has been declared,
+	/// and if `declared_type` is given, checks the class name matches it.
+	fn check_new_expr(&self, expr: &str, declared_type: Option<&str>, var_name: &str, line: usize, col: usize) -> Result<(), LangError> {
+		let e = expr.trim();
+		if !(e.starts_with("new ") && e.ends_with("()")) { return Ok(()); }
+		let class_name = e["new ".len()..e.len() - 2].trim();
+		if !self.classes.contains(class_name) {
+			return Err(LangError::new(
+				format!("Unknown class '{}': class must be declared before use", class_name),
+				line, col,
+			));
+		}
+		if let Some(ty) = declared_type {
+			if !Self::type_compatible(ty, class_name) {
+				return Err(LangError::new(
+					format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", class_name, var_name, ty),
+					line, col,
+				));
+			}
+		}
+		Ok(())
+	}
+
+
 	/// Checks whether a concrete type satisfies a declared type annotation.
 	/// Handles union types (e.g. `int|string`) and the `mixed` wildcard.
 	/// A declared type of `None` (unannotated) always passes.
@@ -482,7 +523,8 @@ impl Transpiler {
 			Some(TokenKind::TypeCallable) => { self.consume(); Ok(String::from("callable")) }
 			Some(TokenKind::Id) => {
 				let t = self.consume().unwrap();
-				Ok(t.value) // class name used as type
+				// class name used as type — validated at assignment since class may be declared after use
+				Ok(t.value)
 			}
 			Some(_) => {
 				let t = self.peek().unwrap();
@@ -766,9 +808,11 @@ impl Transpiler {
 				self.expect(TokenKind::Assign, "after variable name")?;
 				let expr = self.parse_expr(0)?;
 				if let Some(ref ty) = type_ann {
-					// check literal type against declared type
-					if let Some(actual) = Self::infer_literal_type(&expr) {
-						if !Self::type_compatible(ty, actual) {
+					// check new ClassName() — class must be declared and match annotation
+					self.check_new_expr(&expr, Some(ty), &name_tok.value, name_tok.line, name_tok.col)?;
+					// check literal/class type against declared type
+					if let Some(actual) = self.infer_expr_type(&expr) {
+						if !Self::type_compatible(ty, &actual) {
 							return Err(LangError::new(
 								format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, name_tok.value, ty),
 								name_tok.line, name_tok.col,
@@ -790,9 +834,10 @@ impl Transpiler {
 					self.symbols.insert(name_tok.value.clone(), ty.clone());
 					Ok(format!("${} = ({}) {}", name_tok.value, ty, expr))
 				} else {
-					// no type annotation — infer from literal and store if possible
-					if let Some(inferred) = Self::infer_literal_type(&expr) {
-						self.symbols.insert(name_tok.value.clone(), inferred.to_string());
+					// no type annotation — validate class exists, infer type for symbol table
+					self.check_new_expr(&expr, None, &name_tok.value, name_tok.line, name_tok.col)?;
+					if let Some(inferred) = self.infer_expr_type(&expr) {
+						self.symbols.insert(name_tok.value.clone(), inferred);
 					}
 					Ok(format!("${} = {}", name_tok.value, expr))
 				}
@@ -882,6 +927,7 @@ impl Transpiler {
 					)),
 					None => return Err(LangError::new("Expected class name after 'class'", class_tok.line, class_tok.col)),
 				};
+				self.classes.insert(class_name.clone());
 				self.expect(TokenKind::LBrace, "to open class body")?;
 				let mut body = String::new();
 				while let Some(t) = self.peek() {
@@ -1016,13 +1062,14 @@ impl Transpiler {
 					if lhs.starts_with('$') && !lhs.contains("->") && !lhs.contains('[') {
 						let var_name = lhs.trim_start_matches('$');
 						if let Some(declared) = self.symbols.get(var_name).cloned() {
-							if let Some(actual) = Self::infer_literal_type(&expr) {
-								if !Self::type_compatible(&declared, actual) {
-									return Err(LangError::new(
-										format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, var_name, declared),
-										name_tok.line, name_tok.col,
-									));
-								}
+							self.check_new_expr(&expr, Some(&declared), var_name, name_tok.line, name_tok.col)?;
+							if let Some(actual) = self.infer_expr_type(&expr) {
+							if !Self::type_compatible(&declared, &actual) {
+								return Err(LangError::new(
+									format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, var_name, declared),
+									name_tok.line, name_tok.col,
+								));
+							}
 							}
 							if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
 								let src_name = expr.trim_start_matches('$');
