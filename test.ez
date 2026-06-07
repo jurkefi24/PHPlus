@@ -1,13 +1,66 @@
-let test = "Funguje to?"
-print test
-let premek = 567643464556443
+// PHPlus Showcase
 
-print premek
+include "utils.ez"
 
-let numTest = 12
+class User {
+    let name: string = ""
+    private let role: string = "member"
 
-print premek - numtest
+    fn greet(): void {
+        print "Hello, " + self.name
+    }
+}
 
-print premek || numtest
+fn add(a: int, b: int): int {
+    return a + b
+}
 
-let print = 
+let username: string = "Alice"
+let age: int = 25
+let score: float = 98.5
+let active: bool = true
+
+print username
+print age
+print score
+
+let numbers: array = [1, 2, 3, 4, 5]
+print numbers[0]
+
+let user: User = new User()
+user.name = "Bob"
+user.greet()
+
+if (age >= 18 && active) {
+    print "Adult user"
+} else {
+    print "Minor or inactive"
+}
+
+/*
+this is a long 
+comment
+maybe explaining the reason 
+for this code to exist
+*/
+
+let i: int = 0
+
+while (i < 3) {
+    print i
+    i = i + 1
+}
+
+for (let j = 0; j < 5; j = j + 1) {
+    print j
+}
+
+let result: int = add(10, 20)
+print result
+
+let optionalUser: ?User = null
+
+let value: int|string = 42
+
+$_SESSION["username"] = username
+print $_SESSION["username"]

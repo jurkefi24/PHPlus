@@ -3,10 +3,12 @@ use std::fs;
 use std::fmt;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 
-// --- ERROR TYPE ---
-
-/// Represents a compiler error with a human-readable message and the source location where it occurred.
+/// Represents a source-level error produced during lexing, parsing, or transpilation.
+///
+/// Stores a human-readable message together with the line and column position
+/// in the source file where the error was detected, enabling precise diagnostics.
 #[derive(Debug)]
 struct LangError {
 	message: String,
@@ -15,108 +17,137 @@ struct LangError {
 }
 
 impl LangError {
-	/// Creates a new `LangError` with the given message, line number, and column number.
+	/// Creates a new [`LangError`] with the given message and source location.
+	///
+	/// # Arguments
+	///
+	/// * `message` – A description of the error; accepts any type that converts
+	///   into a [`String`] (e.g. `&str`, `String`, or a formatted string).
+	/// * `line` – The 1-based line number in the source file.
+	/// * `col` – The 1-based column number in the source file.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// let err = LangError::new("Unterminated string", 3, 12);
+	/// ```
 	fn new(message: impl Into<String>, line: usize, col: usize) -> Self {
 		LangError { message: message.into(), line, col }
 	}
 }
 
 impl fmt::Display for LangError {
-	/// Formats the error as `[line:col] Error: message` for printing to stderr.
+	/// Formats the error as `[line:col] Error: <message>` for user-facing output.
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "[{}:{}] Error: {}", self.line, self.col, self.message)
 	}
 }
 
-// --- LEXER ---
-
 #[derive(Debug, PartialEq, Clone)]
 enum TokenKind {
-	Print,          //prints stuff (duh)
-	Let,            // variable definition
-	If,             // if keyword
-	Else,           // else keyword
-	While,          // while keyword
-	For,            // for keyword
-	Class,          // class keyword
-	New,            // new keyword
-	Fn,             // fn keyword
-	Return,         // return keyword
-	Semicolon,      // ; used as separator in for loops
+	Print,
+	Let,
+	If,
+	Else,
+	While,
+	For,
+	Class,
+	New,
+	Fn,
+	Return,
+	Semicolon,
 
-	// data types
 	String,
 	Number,
 
-	// type annotation keywords
-	TypeInt,        // int
-	TypeFloat,      // float
-	TypeString,     // string
-	TypeBool,       // bool
-	TypeArray,      // array
-	TypeVoid,       // void
-	TypeNull,       // null
-	TypeMixed,      // mixed
-	TypeNever,      // never
-	TypeObject,     // object
-	TypeCallable,   // callable
-	Question,       // ? nullable prefix
-	Pipe,           // | single pipe, used in union types
+	TypeInt,
+	TypeFloat,
+	TypeString,
+	TypeBool,
+	TypeArray,
+	TypeVoid,
+	TypeNull,
+	TypeMixed,
+	TypeNever,
+	TypeObject,
+	TypeCallable,
+	Question,
+	Pipe,
 
-	Id,        // variable name
-	Superglobal, // $_POST, $_GET, $_SESSION, $_SERVER, $_COOKIE
-	Self_,     // self keyword, becomes $this in PHP
-	Assign,    // assigns value to a variable ( = )
-	Colon,     // : used for type annotations
+	Id,
+	Superglobal,
+	Self_,
+	Assign,
+	Colon,
 
-	// math
-	Plus,   // +
-	Minus,  // -
-	Star,   // *
-	Slash,  // /
+	Plus,
+	Minus,
+	Star,
+	Slash,
+       	PlusEq,
+	MinusEq,
+	StarEq,
+	SlashEq,
+	PlusPlus,
+	MinusMinus,
 
-	// logical operators
-	Eq,     // ==
-	NotEq,  // !=
-	Lt,     // <
-	Gt,     // >
-	LtEq,   // <=
-	GtEq,   // >=
-	And,    // &&
-	Or,     // ||
-	Not,    // !
-	LParen, // (
-	RParen, // )
-	LBrace, // {
-	RBrace, // }
-	LBracket, // [ array literal / index access
-	RBracket, // ]
-	True,   // true
-	False,  // false
-	Dot,    // . property access
-	Comma,  // , parameter separator
-	Private, // private keyword
-	Include, // include keyword
+
+	Eq,
+	NotEq,
+	Lt,
+	Gt,
+	LtEq,
+	GtEq,
+	And,
+	Or,
+	Not,
+	LParen,
+	RParen,
+	LBrace,
+	RBrace,
+	LBracket,
+	RBracket,
+	True,
+	False,
+	Dot,
+	Comma,
+	Private,
+	Include,
 }
 
-/// A single lexical unit produced by the lexer.
-/// Stores the token's kind, its raw source string, and the source location it came from.
 #[derive(Debug, Clone)]
-struct Token {  //Pairs the data type and the value from source code
+struct Token {
 	kind: TokenKind,
 	value: String,
 	line: usize,
 	col: usize,
 }
 
-/// Converts raw EzLang source code into a flat list of tokens.
+/// Converts raw source code into a flat list of [`Token`]s.
 ///
-/// Walks the source string character by character, classifying each chunk into
-/// a `Token` with kind, value, and source location. Whitespace is skipped.
+/// The lexer performs a single left-to-right pass over `code`, recognising
+/// keywords, identifiers, numeric literals (decimal, hex `0x`, octal `0o`,
+/// binary `0b`, and floating-point with optional exponent), string literals
+/// (both `"…"` and `'…'`), PHP-style superglobals (`$_POST`, etc.), and all
+/// operator/punctuation symbols defined by the language.
+///
+/// # Arguments
+///
+/// * `code` – The full source text to tokenise.
 ///
 /// # Errors
-/// Returns a `LangError` on: unexpected characters, unterminated strings,
-/// malformed numbers (multiple decimal points), or lone `&` / `|`.
+///
+/// Returns a [`LangError`] if the source contains:
+/// * An unterminated string literal.
+/// * A number with more than one decimal point.
+/// * An unrecognised superglobal (anything starting with `$` that is not one
+///   of the five supported names).
+/// * A single `&` (only `&&` is valid).
+/// * Any character that does not match any token pattern.
+///
+/// # Returns
+///
+/// A [`Vec<Token>`] on success, where tokens appear in source order.
 fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 	let mut tokens = Vec::new();
 	let mut chars = code.chars().peekable();
@@ -125,10 +156,10 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 
 	while let Some(&ch) = chars.peek() {
 		match ch {
-			'\n' => { chars.next(); line += 1; col = 1; }                                             //If character is Empty, Skip
+			'\n' => { chars.next(); line += 1; col = 1; }
 			' ' | '\t' | '\r' => { chars.next(); col += 1; }
 
-			'"' => {                                                                                		//If char is ", loops through following chars until hitting the next "
+			'"' => {
 				let start_col = col;
 				chars.next(); col += 1;
 				let mut s = String::from('"');
@@ -145,10 +176,9 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				tokens.push(Token { kind: TokenKind::String, value: s, line, col: start_col });
 			}
 
-			c if c.is_ascii_digit() => {                                                      		//If char is a Number
+			c if c.is_ascii_digit() => {
 				let start_col = col;
 				let mut num = String::new();
-				// check for 0x / 0o / 0b prefix
 				num.push(c); chars.next(); col += 1;
 				if c == '0' {
 					if let Some(&next) = chars.peek() {
@@ -176,7 +206,6 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 						}
 					}
 				}
-				// decimal / float / scientific
 				let mut dots = 0u8;
 				while let Some(&c) = chars.peek() {
 					if c.is_ascii_digit() { num.push(c); chars.next(); col += 1; }
@@ -187,7 +216,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 						}
 						num.push(c); chars.next(); col += 1;
 					}
-					else if c == 'e' || c == 'E' {                                                  // scientific notation: 1.5e10
+					else if c == 'e' || c == 'E' {
 						num.push(c); chars.next(); col += 1;
 						if let Some(&sign) = chars.peek() {
 							if sign == '+' || sign == '-' { num.push(sign); chars.next(); col += 1; }
@@ -202,7 +231,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				tokens.push(Token { kind: TokenKind::Number, value: num, line, col: start_col });
 			}
 
-			'$' => {                                                                                    // superglobal: $_POST, $_GET, $_SESSION, $_SERVER, $_COOKIE
+			'$' => {
 				let start_col = col;
 				chars.next(); col += 1;
 				let mut word = String::from('$');
@@ -220,7 +249,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				tokens.push(Token { kind, value: word, line, col: start_col });
 			}
 
-			c if c.is_alphabetic() || c == '_' => {                                           		//If char is Alphabetic, check if the word is a keyword afterward, else it's a var name
+			c if c.is_alphabetic() || c == '_' => {
 				let start_col = col;
 				let mut word = String::new();
 				while let Some(&c) = chars.peek() {
@@ -236,7 +265,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 					"for"     => TokenKind::For,
 					"true"    => TokenKind::True,
 					"false"   => TokenKind::False,
-					"echo"    => TokenKind::Print,    // echo is an alias for print
+					"echo"    => TokenKind::Print,
 					"class"   => TokenKind::Class,
 					"new"     => TokenKind::New,
 					"fn"      => TokenKind::Fn,
@@ -247,6 +276,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 					"int"     => TokenKind::TypeInt,
 					"float"   => TokenKind::TypeFloat,
 					"string"  => TokenKind::TypeString,
+                                        "str"     => TokenKind::TypeString,
 					"bool"    => TokenKind::TypeBool,
 					"array"   => TokenKind::TypeArray,
 					"void"     => TokenKind::TypeVoid,
@@ -260,7 +290,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				tokens.push(Token { kind, value: word, line, col: start_col });
 			}
 
-			'=' => {                                                                                		//If next char is also =, it's a comparing ==, else it's an assigning =
+			'=' => {
 				let start_col = col;
 				chars.next(); col += 1;
 				if chars.peek() == Some(&'=') {
@@ -271,7 +301,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				}
 			}
 
-			'!' => {                                                                                		//Logical Negation
+			'!' => {
 				let start_col = col;
 				chars.next(); col += 1;
 				if chars.peek() == Some(&'=') {
@@ -326,7 +356,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 				}
 			}
 
-			'\'' => {																														// single-quoted string
+			'\'' => {
 				let start_col = col;
 				chars.next(); col += 1;
 				let mut s = String::from('\'');
@@ -346,11 +376,77 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 			'.' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Dot,       value: String::from("."),  line, col: c }); }
 			',' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Comma,     value: String::from(","),  line, col: c }); }
 			':' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Colon,     value: String::from(":"),  line, col: c }); }
-			'+' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Plus,      value: String::from("+"),  line, col: c }); }
-			'-' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Minus,     value: String::from("-"),  line, col: c }); }
-			'*' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Star,      value: String::from("*"),  line, col: c }); }
-			'/' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::Slash,     value: String::from("/"),  line, col: c }); }
-			'(' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LParen,    value: String::from("("),  line, col: c }); }
+			'+' => {
+				let start_col = col;
+				chars.next(); col += 1;
+				if chars.peek() == Some(&'=') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::PlusEq,   value: String::from("+="), line, col: start_col });
+				} else if chars.peek() == Some(&'+') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::PlusPlus, value: String::from("++"), line, col: start_col });
+				} else {
+					tokens.push(Token { kind: TokenKind::Plus,     value: String::from("+"),  line, col: start_col });
+				}
+			}
+			'-' => {
+				let start_col = col;
+				chars.next(); col += 1;
+				if chars.peek() == Some(&'=') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::MinusEq,    value: String::from("-="), line, col: start_col });
+				} else if chars.peek() == Some(&'-') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::MinusMinus, value: String::from("--"), line, col: start_col });
+				} else {
+					tokens.push(Token { kind: TokenKind::Minus,      value: String::from("-"),  line, col: start_col });
+				}
+			}
+			'*' => {
+				let start_col = col;
+				chars.next(); col += 1;
+				if chars.peek() == Some(&'=') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::StarEq, value: String::from("*="), line, col: start_col });
+				} else {
+					tokens.push(Token { kind: TokenKind::Star,   value: String::from("*"),  line, col: start_col });
+				}
+			}
+			'/' => {
+				let start_col = col;
+				chars.next(); col += 1;
+				if chars.peek() == Some(&'/') {
+					chars.next(); col += 1;
+					while let Some(&c) = chars.peek() {
+						chars.next();
+						if c == '\n' { line += 1; col = 1; break; }
+						col += 1;
+					}
+				} else if chars.peek() == Some(&'*') {
+					chars.next(); col += 1;
+					loop {
+						match chars.next() {
+							None => return Err(LangError::new("Unterminated block comment", line, start_col)),
+							Some('\n') => { line += 1; col = 1; }
+							Some('*') => {
+								col += 1;
+								if chars.peek() == Some(&'/') {
+									chars.next(); col += 1;
+									break;
+								}
+							}
+							Some(_) => { col += 1; }
+						}
+					}
+				} else if chars.peek() == Some(&'=') {
+					chars.next(); col += 1;
+					tokens.push(Token { kind: TokenKind::SlashEq, value: String::from("/="), line, col: start_col });
+				} else {
+					tokens.push(Token { kind: TokenKind::Slash,   value: String::from("/"),  line, col: start_col });
+				}
+			}
+	
+                        '(' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LParen,    value: String::from("("),  line, col: c }); }
 			')' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RParen,    value: String::from(")"),  line, col: c }); }
 			'{' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::LBrace,    value: String::from("{"),  line, col: c }); }
 			'}' => { let c = col; chars.next(); col += 1; tokens.push(Token { kind: TokenKind::RBrace,    value: String::from("}"),  line, col: c }); }
@@ -365,40 +461,63 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 	Ok(tokens)
 }
 
-// --- TRANSPILER ---
-
-/// Single-pass transpiler that consumes the token list and emits PHP source code.
-/// No AST is built; tokens are consumed and PHP strings are emitted directly.
-struct Transpiler {                                                                                 		//Owns the token list and tracks the current position
+/// Stateful transpiler that converts a token stream into PHP source code.
+///
+/// The transpiler owns the full token list and advances through it with a
+/// position cursor. It maintains two auxiliary data structures:
+///
+/// * `symbols` – A map from variable name to its declared type string, used
+///   for type-checking in strict mode.
+/// * `classes` – The set of class names declared so far; required to validate
+///   `new ClassName()` expressions.
+///
+/// When `strict` is `true`, every variable and parameter must have an explicit
+/// type annotation, and all assignments are checked for type compatibility.
+struct Transpiler {
 	tokens: Vec<Token>,
 	pos: usize,
-	symbols: HashMap<String, String>, // variable name -> declared type
-	classes: HashSet<String>,          // declared class names
+	symbols: HashMap<String, String>,
+	classes: HashSet<String>,
+	strict: bool,
 }
 
 impl Transpiler {
-	/// Creates a new `Transpiler` from a token list, with `pos` starting at 0.
-	fn new(tokens: Vec<Token>) -> Self {
-		Transpiler { tokens, pos: 0, symbols: HashMap::new(), classes: HashSet::new() }
+	/// Creates a new [`Transpiler`] from a token stream.
+	///
+	/// # Arguments
+	///
+	/// * `tokens` – The flat token list produced by [`lexer`].
+	/// * `strict` – When `true`, type annotations are mandatory and assignments
+	///   are type-checked. Pass `false` to allow unannotated code.
+	fn new(tokens: Vec<Token>, strict: bool) -> Self {
+		Transpiler { tokens, pos: 0, symbols: HashMap::new(), classes: HashSet::new(), strict }
 	}
 
-	/// Returns a reference to the current token without advancing `pos`.
-	fn peek(&self) -> Option<&Token> {                                                              		//Returns a reference without moving the position
+	/// Returns a reference to the token at the current position without
+	/// advancing the cursor, or `None` if all tokens have been consumed.
+	fn peek(&self) -> Option<&Token> {
 		self.tokens.get(self.pos)
 	}
 
-	/// Clones and returns the current token, then advances `pos` by one.
-	/// Returns `None` if already past the end of the token list.
-	fn consume(&mut self) -> Option<Token> {																//Returns a Clone of the current token and moves the counter
+	/// Advances the cursor by one and returns the token that was at the
+	/// current position, or `None` if the stream is exhausted.
+	fn consume(&mut self) -> Option<Token> {
 		let token = self.tokens.get(self.pos).cloned();
 		self.pos += 1;
 		token
 	}
 
-	/// Consumes the current token and returns it if it matches `kind`.
-	/// If it doesn't match, returns a `LangError` describing what was expected vs. what was found.
-	/// `context` is a short string appended to the error message to clarify where the token was expected.
-	fn expect(&mut self, kind: TokenKind, context: &str) -> Result<Token, LangError> {					// Consumes a token, errors if it isn't the expected kind
+	/// Consumes the next token and verifies that its kind matches `kind`.
+	///
+	/// `context` is a short human-readable phrase describing the syntactic
+	/// role of the expected token (e.g. `"after 'if'"`), included in the
+	/// error message to aid debugging.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if the next token has a different kind than
+	/// expected, or if the token stream is exhausted.
+	fn expect(&mut self, kind: TokenKind, context: &str) -> Result<Token, LangError> {
 		match self.consume() {
 			Some(t) if t.kind == kind => Ok(t),
 			Some(t) => Err(LangError::new(
@@ -412,9 +531,22 @@ impl Transpiler {
 		}
 	}
 
-	/// Infers the concrete type of a PHP literal expression string.
-	/// Only handles values that are unambiguously a single type.
-	/// Returns `None` for anything that requires runtime information (variables, expressions).
+	/// Attempts to determine the type of a single literal expression string.
+	///
+	/// Inspects `expr` using purely lexical rules (no symbol-table lookup) and
+	/// returns a static type name if the expression is recognisably a literal:
+	///
+	/// | Literal form | Returned type |
+	/// |---|---|
+	/// | `true` / `false` | `"bool"` |
+	/// | `null` | `"null"` |
+	/// | `"…"` or `'…'` | `"string"` |
+	/// | `0x…` / `0o…` / `0b…` | `"int"` |
+	/// | digits with `.`, `e`, or `E` | `"float"` |
+	/// | plain digits (optionally negative) | `"int"` |
+	///
+	/// Returns `None` for expressions that are not recognisable literals (e.g.
+	/// variable references or function calls).
 	fn infer_literal_type(expr: &str) -> Option<&'static str> {
 		let e = expr.trim();
 		if e == "true" || e == "false"                        { return Some("bool");   }
@@ -434,9 +566,12 @@ impl Transpiler {
 		None
 	}
 
-	/// Infers the type of an expression that may include `new ClassName()`.
-	/// Extends `infer_literal_type` with class instantiation recognition.
-	/// Returns `None` for anything unresolvable at compile time.
+	/// Attempts to infer the type of an arbitrary expression string.
+	///
+	/// Extends [`Self::infer_literal_type`] with one additional rule: if `expr`
+	/// has the form `new ClassName()`, the class name is returned as the type.
+	///
+	/// Returns `None` when the type cannot be determined statically.
 	fn infer_expr_type(&self, expr: &str) -> Option<String> {
 		if let Some(lit) = Self::infer_literal_type(expr) {
 			return Some(lit.to_string());
@@ -449,8 +584,26 @@ impl Transpiler {
 		None
 	}
 
-	/// Validates a `new ClassName()` expression: checks the class has been declared,
-	/// and if `declared_type` is given, checks the class name matches it.
+	/// Validates a `new ClassName()` expression for correctness and type compatibility.
+	///
+	/// If `expr` is not a `new` expression this method is a no-op and returns
+	/// `Ok(())`.  Otherwise it checks:
+	///
+	/// 1. The class named in the expression has already been declared.
+	/// 2. *(strict mode only)* If `declared_type` is provided, the class name is
+	///    compatible with that type via [`Self::type_compatible`].
+	///
+	/// # Arguments
+	///
+	/// * `expr` – The transpiled expression string to inspect.
+	/// * `declared_type` – The annotated type of the target variable, if any.
+	/// * `var_name` – The variable name, used solely for error messages.
+	/// * `line` / `col` – Source position for error reporting.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if the class is unknown or if the type is
+	/// incompatible in strict mode.
 	fn check_new_expr(&self, expr: &str, declared_type: Option<&str>, var_name: &str, line: usize, col: usize) -> Result<(), LangError> {
 		let e = expr.trim();
 		if !(e.starts_with("new ") && e.ends_with("()")) { return Ok(()); }
@@ -461,43 +614,62 @@ impl Transpiler {
 				line, col,
 			));
 		}
-		if let Some(ty) = declared_type {
-			if !Self::type_compatible(ty, class_name) {
-				return Err(LangError::new(
-					format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", class_name, var_name, ty),
-					line, col,
-				));
+		if self.strict {
+			if let Some(ty) = declared_type {
+				if !Self::type_compatible(ty, class_name) {
+					return Err(LangError::new(
+						format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", class_name, var_name, ty),
+						line, col,
+					));
+				}
 			}
 		}
 		Ok(())
 	}
 
-
-	/// Checks whether a concrete type satisfies a declared type annotation.
-	/// Handles union types (e.g. `int|string`) and the `mixed` wildcard.
-	/// A declared type of `None` (unannotated) always passes.
+	/// Returns `true` if a value of type `actual` can be stored in a variable
+	/// declared as `declared`.
+	///
+	/// Compatibility rules:
+	/// * `declared == "mixed"` accepts any type.
+	/// * A union type (`"int|string"`) accepts any of its constituent parts.
+	/// * Otherwise the strings must match exactly.
+	///
+	/// # Arguments
+	///
+	/// * `declared` – The annotated type, possibly a `|`-separated union.
+	/// * `actual` – The concrete type of the value being assigned.
 	fn type_compatible(declared: &str, actual: &str) -> bool {
 		if declared == "mixed" { return true; }
 		declared.split('|').any(|part| part.trim() == actual)
 	}
 
-	/// Tries to parse an optional type annotation (`: type`) after a variable name or parameter.
-	/// Returns the PHP type string if present, or `None` if no `:` follows.
-	/// Supports: nullable prefix `?type`, union types `int | string | null`,
-	/// and all primitive types plus class names.
+	/// Attempts to parse an optional `: Type` (or `: ?Type` / `: T|U`) annotation
+	/// at the current position.
+	///
+	/// If the next token is not a colon the method consumes nothing and returns
+	/// `Ok(None)`.  Otherwise it consumes the colon, an optional `?` (nullable
+	/// marker), one or more `|`-separated type names, and synthesises the full
+	/// type string:
+	///
+	/// * A `?T` annotation becomes `"T|null"`.
+	/// * A `T|U` annotation becomes `"T|U"`.
+	/// * A plain `T` annotation becomes `"T"`.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if a colon is present but no valid type name follows.
 	fn try_parse_type(&mut self) -> Result<Option<String>, LangError> {
 		if self.peek().map(|t| t.kind.clone()) != Some(TokenKind::Colon) {
 			return Ok(None);
 		}
-		self.consume(); // :
-		// nullable shorthand: ?type  →  int|null
+		self.consume();
 		let nullable = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Question);
 		if nullable { self.consume(); }
 		let first = self.parse_single_type()?;
 		let mut parts = vec![first];
-		// union: type | type | ...
 		while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Pipe) {
-			self.consume(); // |
+			self.consume();
 			parts.push(self.parse_single_type()?);
 		}
 		if nullable { parts.push(String::from("null")); }
@@ -508,8 +680,17 @@ impl Transpiler {
 		}
 	}
 
-	/// Parses a single type name token and returns its PHP string.
-	/// Used by `try_parse_type` to parse each component of a union.
+	/// Consumes and returns a single type keyword or identifier from the token
+	/// stream.
+	///
+	/// Accepts all built-in type keywords (`int`, `float`, `string`, `bool`,
+	/// `array`, `void`, `null`, `mixed`, `never`, `object`, `callable`) as well
+	/// as arbitrary identifiers for user-defined class types.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if the current token is not a valid type name
+	/// or if the stream is exhausted.
 	fn parse_single_type(&mut self) -> Result<String, LangError> {
 		match self.peek().map(|t| t.kind.clone()) {
 			Some(TokenKind::TypeInt)      => { self.consume(); Ok(String::from("int"))      }
@@ -525,7 +706,6 @@ impl Transpiler {
 			Some(TokenKind::TypeCallable) => { self.consume(); Ok(String::from("callable")) }
 			Some(TokenKind::Id) => {
 				let t = self.consume().unwrap();
-				// class name used as type — validated at assignment since class may be declared after use
 				Ok(t.value)
 			}
 			Some(_) => {
@@ -539,8 +719,44 @@ impl Transpiler {
 		}
 	}
 
-	/// Parses a comma-separated parameter list, returning each as a PHP `$name` or typed `type $name`.
-	/// Stops at `)`. Used by both `fn` and class methods.
+	/// Emits an error if strict mode is active and a type annotation is absent.
+	///
+	/// Call this immediately after [`Self::try_parse_type`] returns `None` to
+	/// enforce the strict-mode requirement that all variables and parameters
+	/// carry explicit type annotations.
+	///
+	/// # Arguments
+	///
+	/// * `name` – The variable or parameter name, included in the error message.
+	/// * `line` / `col` – Source position for error reporting.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] when `self.strict` is `true`.
+	fn require_type_annotation(&self, name: &str, line: usize, col: usize) -> Result<(), LangError> {
+		if self.strict {
+			return Err(LangError::new(
+				format!("Missing type annotation for '{}': type annotations are required in strict mode (use --no-strict or -ns to disable)", name),
+				line, col,
+			));
+		}
+		Ok(())
+	}
+
+	/// Parses a comma-separated function or method parameter list.
+	///
+	/// Reads zero or more parameters of the form `name` or `name: Type` from
+	/// the token stream, stopping when it encounters a `)` token (which is
+	/// **not** consumed).  In strict mode, parameters without a type annotation
+	/// trigger [`Self::require_type_annotation`].
+	///
+	/// Returns a PHP-style parameter string such as `"int $x, string $y"`.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if a parameter name is missing, a comma is
+	/// expected between parameters but absent, or a type annotation is
+	/// malformed.
 	fn parse_param_list(&mut self) -> Result<String, LangError> {
 		let mut params: Vec<String> = Vec::new();
 		while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RParen) {
@@ -556,6 +772,9 @@ impl Transpiler {
 				None => return Err(LangError::new("Expected parameter name, got end of file", 0, 0)),
 			};
 			let type_ann = self.try_parse_type()?;
+			if type_ann.is_none() {
+				self.require_type_annotation(&param_tok.value, param_tok.line, param_tok.col)?;
+			}
 			let param_str = match type_ann {
 				Some(ty) => format!("{} ${}", ty, param_tok.value),
 				None     => format!("${}", param_tok.value),
@@ -565,15 +784,30 @@ impl Transpiler {
 		Ok(params.join(", "))
 	}
 
-	/// Parses the smallest indivisible unit of an expression.
+	/// Parses a primary expression from the token stream.
 	///
-	/// Handles: parenthesised groups `(expr)`, unary `!expr`, unary `-expr`,
-	/// variable references (prepends `$`), `self` (becomes `$this`),
-	/// superglobals (passed through as-is), array literals `[a, b, c]`,
-	/// array index access `arr[i]`, string literals, number literals,
-	/// boolean literals, and `new ClassName()` instantiation.
-	/// Called by `parse_expr` to get the left-hand side before looking for a binary operator.
-	fn parse_primary(&mut self) -> Result<String, LangError> {												//Parses a single primary: literal, variable, unary op, or grouped expression
+	/// A primary expression is the highest-precedence, indivisible unit of an
+	/// expression.  This method handles:
+	///
+	/// * Parenthesised sub-expressions `(expr)`
+	/// * Unary `!` (logical not) and `-` (negation)
+	/// * `self` (mapped to `$this`)
+	/// * Superglobal variables (`$_POST`, etc.) with optional index access
+	/// * Array literals `[a, b, c]`
+	/// * Identifiers – either a function call `f(args)` or a variable `$x`
+	///   with optional index/postfix access
+	/// * String and number literals
+	/// * Boolean literals `true` / `false` and `null`
+	/// * Object instantiation `new ClassName()`
+	///
+	/// After parsing the core primary, any trailing `.attr` or `.method(args)`
+	/// accesses are consumed by [`Self::parse_postfix`].
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] on any syntax violation encountered while
+	/// parsing the primary or its postfix chain.
+	fn parse_primary(&mut self) -> Result<String, LangError> {
 		match self.peek().map(|t| t.kind.clone()) {
 			Some(TokenKind::LParen) => {
 				self.consume();
@@ -591,15 +825,15 @@ impl Transpiler {
 				let operand = self.parse_primary()?;
 				Ok(format!("-{}", operand))
 			}
-			Some(TokenKind::Self_) => {																		// self.attr becomes $this->attr
+			Some(TokenKind::Self_) => {
 				self.consume();
 				self.parse_postfix(String::from("$this"))
 			}
-			Some(TokenKind::Superglobal) => {																// $_POST, $_GET, etc. passed through as-is
+			Some(TokenKind::Superglobal) => {
 				let t = self.consume().unwrap();
 				self.parse_index(t.value)
 			}
-			Some(TokenKind::LBracket) => {																	// array literal: [1, 2, 3]
+			Some(TokenKind::LBracket) => {
 				self.consume();
 				let mut items: Vec<String> = Vec::new();
 				while self.peek().map(|t| t.kind.clone()) != Some(TokenKind::RBracket) {
@@ -611,7 +845,7 @@ impl Transpiler {
 				self.expect(TokenKind::RBracket, "to close array literal")?;
 				Ok(format!("[{}]", items.join(", ")))
 			}
-			Some(TokenKind::Id) => {																		//Adds the $ before a variable
+			Some(TokenKind::Id) => {
 				let t = self.consume().unwrap();
 				if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
 					self.consume();
@@ -637,7 +871,7 @@ impl Transpiler {
 			Some(TokenKind::True)     => { self.consume(); Ok(String::from("true"))  }
 			Some(TokenKind::False)    => { self.consume(); Ok(String::from("false")) }
 			Some(TokenKind::TypeNull) => { self.consume(); Ok(String::from("null"))  }
-			Some(TokenKind::New)   => {																		// new ClassName() instantiation
+			Some(TokenKind::New)   => {
 				let tok = self.consume().unwrap();
 				let class_name = match self.consume() {
 					Some(t) if t.kind == TokenKind::Id => t.value,
@@ -663,8 +897,16 @@ impl Transpiler {
 		}
 	}
 
-	/// Parses zero or more `[index]` suffixes after a base expression.
-	/// Translates `arr[i]` to `$arr[$i]` in PHP. Chains left-to-right.
+	/// Parses zero or more `[index]` subscript accesses on `left`.
+	///
+	/// Repeatedly consumes `[`, an index expression, and `]` while the next
+	/// token is `[`, returning the accumulated string such as
+	/// `"$arr[$i][$j]"`.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if a `]` is missing or the index expression is
+	/// invalid.
 	fn parse_index(&mut self, mut left: String) -> Result<String, LangError> {
 		while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LBracket) {
 			self.consume();
@@ -675,10 +917,16 @@ impl Transpiler {
 		Ok(left)
 	}
 
-	/// Parses a postfix property/method access chain: `expr.attr` or `expr.method(args)`.
+	/// Parses zero or more `.attribute` or `.method(args)` postfix accesses on `left`.
 	///
-	/// Called after `parse_primary` to consume any number of `.attr` or `.method()` suffixes.
-	/// Translates `obj.attr` to `$obj->attr` and `obj.method(args)` to `$obj->method(args)` in PHP.
+	/// Repeatedly consumes `.`, an identifier, and – if followed by `(` – an
+	/// argument list, translating them into PHP `->` method/property accesses.
+	/// For example, `obj.foo(1)` becomes `$obj->foo(1)`.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if an attribute name is missing after `.`, or if
+	/// an argument list is malformed.
 	fn parse_postfix(&mut self, mut left: String) -> Result<String, LangError> {
 		while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Dot) {
 			let dot_tok = self.consume().unwrap();
@@ -708,26 +956,47 @@ impl Transpiler {
 		Ok(left)
 	}
 
-	/// Maps a binary operator token to its precedence level (1 = loosest, 6 = tightest).
-	/// Returns `None` for any token that is not a binary operator,
-	/// which signals `parse_expr` to stop climbing.
-	fn op_precedence(kind: &TokenKind) -> Option<u8> {														//Basic order of operations
+	/// Returns the precedence level of a binary operator token kind, or `None`
+	/// if the token is not a binary operator.
+	///
+	/// Higher values bind more tightly (evaluated first).  The table is:
+	///
+	/// | Precedence | Operators |
+	/// |---|---|
+	/// | 1 (lowest) | `\|\|` |
+	/// | 2 | `&&` |
+	/// | 3 | `==`, `!=` |
+	/// | 4 | `<`, `>`, `<=`, `>=` |
+	/// | 5 | `+`, `-` |
+	/// | 6 (highest) | `*`, `/` |
+	fn op_precedence(kind: &TokenKind) -> Option<u8> {
 		match kind {
 			TokenKind::Or                                           				=> Some(1),
 			TokenKind::And                                          				=> Some(2),
-			TokenKind::Eq | TokenKind::NotEq                       					=> Some(3),
-			TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq		=> Some(4),
-			TokenKind::Plus | TokenKind::Minus                     					=> Some(5),
-			TokenKind::Star | TokenKind::Slash                     					=> Some(6),
+			TokenKind::Eq | TokenKind::NotEq                       				=> Some(3),
+			TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq	=> Some(4),
+			TokenKind::Plus | TokenKind::Minus                     				=> Some(5),
+			TokenKind::Star | TokenKind::Slash                     				=> Some(6),
 			_                                                       				=> None,
 		}
 	}
 
-	/// Parses a binary expression using precedence climbing.
+	/// Parses a binary expression using Pratt (precedence-climbing) parsing.
 	///
-	/// Calls `parse_primary` for the initial left-hand side, then loops consuming
-	/// binary operators whose precedence is >= `min_prec`. Recursing with `prec + 1`
-	/// enforces left-associativity. Pass `min_prec = 0` to parse a full expression.
+	/// Begins by parsing a primary expression, then repeatedly consumes
+	/// left-associative binary operators whose precedence is `>= min_prec`,
+	/// recursively parsing the right-hand side at `prec + 1`.
+	///
+	/// Call with `min_prec = 0` to parse a full expression.
+	///
+	/// # Arguments
+	///
+	/// * `min_prec` – The minimum operator precedence to continue consuming.
+	///   Callers should pass `0` for a top-level expression.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] from any sub-expression that fails to parse.
 	fn parse_expr(&mut self, min_prec: u8) -> Result<String, LangError> {
 		let mut left = self.parse_primary()?;
 
@@ -748,13 +1017,26 @@ impl Transpiler {
 		Ok(left)
 	}
 
-	/// Parses a brace-delimited block `{ ... }` and returns its contents as indented PHP.
+	/// Parses a `{`…`}` block of statements and returns their PHP representation.
 	///
-	/// `depth` controls the indentation level: each statement inside is prefixed
-	/// with `depth` tabs. Block statements (if/while/for/class/function) get a trailing newline
-	/// instead of a semicolon. The surrounding braces are consumed but not included
-	/// in the return value — the caller formats them.
-	fn parse_block(&mut self, depth: usize) -> Result<String, LangError> {								// Parses { ... } and returns the inner statements indented
+	/// Consumes the opening `{`, iterates over statements at indentation
+	/// `depth + 1` until a `}` is found, then consumes the `}`.  Each
+	/// statement is prefixed with the appropriate indentation:
+	///
+	/// * Block-level statements (`if`, `while`, `for`, `class`, `function`)
+	///   are emitted as-is with a trailing newline.
+	/// * All other statements are terminated with `;` and a newline.
+	///
+	/// # Arguments
+	///
+	/// * `depth` – The current nesting depth; controls the tab indentation of
+	///   the emitted PHP.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if the opening or closing `{`/`}` is missing,
+	/// or if any statement inside the block is invalid.
+	fn parse_block(&mut self, depth: usize) -> Result<String, LangError> {
 		let indent = "\t".repeat(depth);
 		self.expect(TokenKind::LBrace, "to open block")?;
 		let mut body = String::new();
@@ -778,25 +1060,33 @@ impl Transpiler {
 		Ok(body)
 	}
 
-	/// Parses and emits a single statement.
+	/// Parses a single statement and returns its PHP equivalent.
 	///
-	/// Dispatches on the current token kind:
-	/// - `let x[: type] = expr`          → variable declaration (optional type annotation)
-	/// - `x = expr`                       → variable reassignment
-	/// - `x[i] = expr`                    → array index assignment
-	/// - `x.attr = expr`                  → property assignment
-	/// - `self.attr = expr`               → self property assignment (becomes `$this->attr`)
-	/// - `$_POST[key]` etc.               → superglobal index assignment
-	/// - `print expr`                     → echo statement
-	/// - `return expr`                    → return statement
-	/// - `class Name { ... }`             → class definition with properties and methods
-	/// - `fn name(params)[: type] { ... }` → function definition (optional return type)
-	/// - `if / while / for`               → control flow (calls `parse_block` for bodies)
+	/// Dispatches on the current token to handle:
 	///
-	/// `depth` is passed through to `parse_block` for correct indentation.
-	fn statement(&mut self, depth: usize) -> Result<String, LangError> {								//for now, only two statements, Let and Print
+	/// * `let` – Variable declaration with optional type annotation; performs
+	///   strict type-checking when `self.strict` is `true`.
+	/// * `print` / `echo` – Output statement, emitted as `echo`.
+	/// * `return` – Return statement, with or without a value.
+	/// * `if` / `else` – Conditional statement.
+	/// * `while` – While loop.
+	/// * `for` – C-style for loop.
+	/// * `fn` – Top-level function definition.
+	/// * `include` – File inclusion, validated to use `.ez` extension and
+	///   emitted as `require_once`.
+	/// * `class` – Class definition including properties and methods.
+	/// * Superglobal assignment (`$_POST[…] = …`).
+	/// * Identifier assignment or method call.
+	///
+	/// Returns an empty string at end-of-file.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] for any syntactic or type error encountered
+	/// while parsing the statement.
+	fn statement(&mut self, depth: usize) -> Result<String, LangError> {
 		match self.peek().map(|t| t.kind.clone()) {
-			Some(TokenKind::Let) => {																	//expects an ID token, an optional type annotation, an Assign token and an Expression
+			Some(TokenKind::Let) => {
 				self.consume();
 				let name_tok = match self.consume() {
 					Some(t) if t.kind == TokenKind::Id => t,
@@ -807,36 +1097,37 @@ impl Transpiler {
 					None => return Err(LangError::new("Expected variable name after 'let', got end of file", 0, 0)),
 				};
 				let type_ann = self.try_parse_type()?;
+				if type_ann.is_none() {
+					self.require_type_annotation(&name_tok.value, name_tok.line, name_tok.col)?;
+				}
 				self.expect(TokenKind::Assign, "after variable name")?;
 				let expr = self.parse_expr(0)?;
 				if let Some(ref ty) = type_ann {
-					// check new ClassName() — class must be declared and match annotation
 					self.check_new_expr(&expr, Some(ty), &name_tok.value, name_tok.line, name_tok.col)?;
-					// check literal/class type against declared type
-					if let Some(actual) = self.infer_expr_type(&expr) {
-						if !Self::type_compatible(ty, &actual) {
-							return Err(LangError::new(
-								format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, name_tok.value, ty),
-								name_tok.line, name_tok.col,
-							));
-						}
-					}
-					// check variable type against declared type
-					if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
-						let src_name = expr.trim_start_matches('$');
-						if let Some(src_type) = self.symbols.get(src_name).cloned() {
-							if !Self::type_compatible(ty, &src_type) {
+					if self.strict {
+						if let Some(actual) = self.infer_expr_type(&expr) {
+							if !Self::type_compatible(ty, &actual) {
 								return Err(LangError::new(
-									format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", src_type, name_tok.value, ty),
+									format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, name_tok.value, ty),
 									name_tok.line, name_tok.col,
 								));
+							}
+						}
+						if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
+							let src_name = expr.trim_start_matches('$');
+							if let Some(src_type) = self.symbols.get(src_name).cloned() {
+								if !Self::type_compatible(ty, &src_type) {
+									return Err(LangError::new(
+										format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", src_type, name_tok.value, ty),
+										name_tok.line, name_tok.col,
+									));
+								}
 							}
 						}
 					}
 					self.symbols.insert(name_tok.value.clone(), ty.clone());
 					Ok(format!("${} = ({}) {}", name_tok.value, ty, expr))
 				} else {
-					// no type annotation — validate class exists, infer type for symbol table
 					self.check_new_expr(&expr, None, &name_tok.value, name_tok.line, name_tok.col)?;
 					if let Some(inferred) = self.infer_expr_type(&expr) {
 						self.symbols.insert(name_tok.value.clone(), inferred);
@@ -844,12 +1135,12 @@ impl Transpiler {
 					Ok(format!("${} = {}", name_tok.value, expr))
 				}
 			}
-			Some(TokenKind::Print) => {																	//prints the expression after it
+			Some(TokenKind::Print) => {
 				self.consume();
 				let expr = self.parse_expr(0)?;
 				Ok(format!("echo {}", expr))
 			}
-			Some(TokenKind::Return) => {																// return statement
+			Some(TokenKind::Return) => {
 				self.consume();
 				if matches!(self.peek().map(|t| t.kind.clone()),
 					Some(TokenKind::RBrace) | None
@@ -860,7 +1151,7 @@ impl Transpiler {
 					Ok(format!("return {}", expr))
 				}
 			}
-			Some(TokenKind::If) => {																	// if (cond) { ... } else { ... }
+			Some(TokenKind::If) => {
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'if'")?;
 				let cond = self.parse_expr(0)?;
@@ -876,7 +1167,7 @@ impl Transpiler {
 				};
 				Ok(format!("if ({}) {{\n{}{}}}{}", cond, if_body, indent, else_part))
 			}
-			Some(TokenKind::While) => {																	// while (cond) { ... }
+			Some(TokenKind::While) => {
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'while'")?;
 				let cond = self.parse_expr(0)?;
@@ -885,7 +1176,7 @@ impl Transpiler {
 				let body = self.parse_block(depth + 1)?;
 				Ok(format!("while ({}) {{\n{}{}}}", cond, body, indent))
 			}
-			Some(TokenKind::For) => {																	// for (init; cond; step) { ... }
+			Some(TokenKind::For) => {
 				self.consume();
 				self.expect(TokenKind::LParen, "after 'for'")?;
 				let init = self.parse_for_clause()?;
@@ -898,7 +1189,7 @@ impl Transpiler {
 				let body = self.parse_block(depth + 1)?;
 				Ok(format!("for ({}; {}; {}) {{\n{}{}}}", init, cond, step, body, indent))
 			}
-			Some(TokenKind::Fn) => {																	// fn name(params[: type])[: return_type] { ... }
+			Some(TokenKind::Fn) => {
 				let fn_tok = self.consume().unwrap();
 				let fn_name = match self.consume() {
 					Some(t) if t.kind == TokenKind::Id => t.value,
@@ -912,6 +1203,9 @@ impl Transpiler {
 				let param_str = self.parse_param_list()?;
 				self.expect(TokenKind::RParen, "to close function parameter list")?;
 				let return_type = self.try_parse_type()?;
+				if return_type.is_none() {
+					self.require_type_annotation(&format!("{}()", fn_name), fn_tok.line, fn_tok.col)?;
+				}
 				let indent = "\t".repeat(depth);
 				let body = self.parse_block(depth + 1)?;
 				match return_type {
@@ -919,7 +1213,7 @@ impl Transpiler {
 					None     => Ok(format!("function {}({}) {{\n{}{}}}", fn_name, param_str, body, indent)),
 				}
 			}
-			Some(TokenKind::Include) => {															// include "file.ez" — emits require_once in PHP
+			Some(TokenKind::Include) => {
 				self.consume();
 				let path_tok = match self.consume() {
 					Some(t) if t.kind == TokenKind::String => t,
@@ -939,7 +1233,7 @@ impl Transpiler {
 				let php_path = ez_path.replace(".ez", ".php");
 				Ok(format!("require_once '{}'", php_path))
 			}
-			Some(TokenKind::Class) => {																	// class Name { let prop = val ... fn method(params) { ... } }
+			Some(TokenKind::Class) => {
 				let class_tok = self.consume().unwrap();
 				let class_name = match self.consume() {
 					Some(t) if t.kind == TokenKind::Id => t.value,
@@ -955,7 +1249,7 @@ impl Transpiler {
 				while let Some(t) = self.peek() {
 					if t.kind == TokenKind::RBrace { break; }
 					match self.peek().map(|t| t.kind.clone()) {
-						Some(TokenKind::Fn) => {														// method: fn name(params[: type])[: return_type] { ... }
+						Some(TokenKind::Fn) => {
 							self.consume();
 							let method_tok = match self.consume() {
 								Some(t) if t.kind == TokenKind::Id => t,
@@ -969,13 +1263,16 @@ impl Transpiler {
 							let param_str = self.parse_param_list()?;
 							self.expect(TokenKind::RParen, "to close method parameter list")?;
 							let return_type = self.try_parse_type()?;
+							if return_type.is_none() {
+								self.require_type_annotation(&format!("{}()", method_tok.value), method_tok.line, method_tok.col)?;
+							}
 							let method_body = self.parse_block(2)?;
 							match return_type {
 								Some(ty) => body.push_str(&format!("\tpublic function {}({}): {} {{\n{}\t}}\n", method_tok.value, param_str, ty, method_body)),
 								None     => body.push_str(&format!("\tpublic function {}({}) {{\n{}\t}}\n", method_tok.value, param_str, method_body)),
 							}
 						}
-						Some(TokenKind::Private) | Some(TokenKind::Let) => {						// property: [private] let name[: type] = val
+						Some(TokenKind::Private) | Some(TokenKind::Let) => {
 							let visibility = if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Private) {
 								self.consume();
 								"private"
@@ -992,6 +1289,9 @@ impl Transpiler {
 								None => return Err(LangError::new("Expected property name in class body", 0, 0)),
 							};
 							let type_ann = self.try_parse_type()?;
+							if type_ann.is_none() {
+								self.require_type_annotation(&prop_tok.value, prop_tok.line, prop_tok.col)?;
+							}
 							self.expect(TokenKind::Assign, "after property name in class body")?;
 							let val = self.parse_expr(0)?;
 							match type_ann {
@@ -1011,7 +1311,7 @@ impl Transpiler {
 				self.expect(TokenKind::RBrace, "to close class body")?;
 				Ok(format!("class {} {{\n{}}}", class_name, body))
 			}
-			Some(TokenKind::Superglobal) => {															// $_POST[key] = expr  superglobal assignment
+			Some(TokenKind::Superglobal) => {
 				let sg_tok = self.consume().unwrap();
 				let mut lhs = sg_tok.value;
 				while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LBracket) {
@@ -1024,9 +1324,8 @@ impl Transpiler {
 				let expr = self.parse_expr(0)?;
 				Ok(format!("{} = {}", lhs, expr))
 			}
-			Some(TokenKind::Self_) | Some(TokenKind::Id) => {											// bare assignment, method call, or bare function call
+			Some(TokenKind::Self_) | Some(TokenKind::Id) => {
 				let name_tok = self.consume().unwrap();
-				// bare function call: foo(args)
 				if name_tok.kind == TokenKind::Id && self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LParen) {
 					self.consume();
 					let mut args: Vec<String> = Vec::new();
@@ -1044,14 +1343,12 @@ impl Transpiler {
 				} else {
 					format!("${}", name_tok.value)
 				};
-				// array index on lhs: x[i] = expr
 				while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::LBracket) {
 					self.consume();
 					let idx = self.parse_expr(0)?;
 					self.expect(TokenKind::RBracket, "to close index")?;
 					lhs = format!("{}[{}]", lhs, idx);
 				}
-				// property chain: x.attr or x.method()
 				while self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Dot) {
 					let dot_tok = self.consume().unwrap();
 					let attr = match self.consume() {
@@ -1080,18 +1377,17 @@ impl Transpiler {
 				if self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Assign) {
 					self.consume();
 					let expr = self.parse_expr(0)?;
-					// type check bare variable reassignment against symbol table
-					if lhs.starts_with('$') && !lhs.contains("->") && !lhs.contains('[') {
+					if self.strict && lhs.starts_with('$') && !lhs.contains("->") && !lhs.contains('[') {
 						let var_name = lhs.trim_start_matches('$');
 						if let Some(declared) = self.symbols.get(var_name).cloned() {
 							self.check_new_expr(&expr, Some(&declared), var_name, name_tok.line, name_tok.col)?;
 							if let Some(actual) = self.infer_expr_type(&expr) {
-							if !Self::type_compatible(&declared, &actual) {
-								return Err(LangError::new(
-									format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, var_name, declared),
-									name_tok.line, name_tok.col,
-								));
-							}
+								if !Self::type_compatible(&declared, &actual) {
+									return Err(LangError::new(
+										format!("Type mismatch: cannot assign {} to variable '{}' declared as {}", actual, var_name, declared),
+										name_tok.line, name_tok.col,
+									));
+								}
 							}
 							if expr.starts_with('$') && !expr.contains(' ') && !expr.contains('[') {
 								let src_name = expr.trim_start_matches('$');
@@ -1108,7 +1404,7 @@ impl Transpiler {
 					}
 					Ok(format!("{} = {}", lhs, expr))
 				} else if lhs.contains("->") && lhs.ends_with(")") {
-					Ok(lhs) // standalone method call statement
+					Ok(lhs)
 				} else {
 					let t = self.peek();
 					let (tline, tcol) = t.map(|t| (t.line, t.col)).unwrap_or((0, 0));
@@ -1127,13 +1423,21 @@ impl Transpiler {
 		}
 	}
 
-	/// Parses the init or step clause inside a `for (init; cond; step)` header.
+	/// Parses a single clause of a `for` loop header (the init or step part).
 	///
-	/// Looks one token ahead to distinguish three cases without consuming prematurely:
-	/// - `let x = expr`  → fresh variable declaration
-	/// - `x = expr`      → reassignment of an existing variable
-	/// - anything else   → treated as a plain expression
-	fn parse_for_clause(&mut self) -> Result<String, LangError> {										// Parses the init or step clause of a for loop (let assignment, bare assignment, or expression)
+	/// Handles three forms:
+	///
+	/// * `let name = expr` – A new variable declaration; emitted as `$name = expr`.
+	/// * `name = expr` – A bare assignment to an existing variable; emitted as `$name = expr`.
+	/// * Any other expression – Parsed as a plain expression (e.g. a function call).
+	///
+	/// This method does **not** consume the surrounding `;` or `)` delimiters.
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if the variable name is missing after `let` or
+	/// the expression is malformed.
+	fn parse_for_clause(&mut self) -> Result<String, LangError> {
 		let is_let = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Let);
 		let is_bare_assign = self.peek().map(|t| t.kind.clone()) == Some(TokenKind::Id)
 			&& self.tokens.get(self.pos + 1).map(|t| t.kind.clone()) == Some(TokenKind::Assign);
@@ -1161,16 +1465,31 @@ impl Transpiler {
 		}
 	}
 
-	/// Drives the full transpilation pass and returns the complete PHP output string.
+	/// Transpiles the entire token stream into a complete PHP source file.
 	///
-	/// Prepends `declare(strict_types=1)` and the PHP opening tag, then calls
-	/// `statement` in a loop until all tokens are consumed.
-	/// Block statements (if/while/for/class/function) get a trailing newline;
-	/// all other statements get a semicolon and newline.
+	/// Prepends the standard PHP prologue:
+	///
+	/// ```php
+	/// <?php
+	/// declare(strict_types=1);
+	/// ```
+	///
+	/// Then repeatedly calls [`Self::statement`] at depth `0` until all tokens
+	/// are consumed, appending each statement with appropriate termination
+	/// (`;` for simple statements, no semicolon for block statements).
+	///
+	/// # Errors
+	///
+	/// Returns a [`LangError`] if any statement in the token stream fails to
+	/// parse or fails a type check.
+	///
+	/// # Returns
+	///
+	/// A [`String`] containing the complete PHP source on success.
 	fn transpile(&mut self) -> Result<String, LangError> {
-		let mut output = String::from("<?php\ndeclare(strict_types=1);\n\n");						//starts PHP with strict types enabled
+		let mut output = String::from("<?php\ndeclare(strict_types=1);\n\n");
 		while self.pos < self.tokens.len() {
-			let stmt = self.statement(0)?;														//calls statement() until there's no more tokens left
+			let stmt = self.statement(0)?;
 			if !stmt.is_empty() {
 				let is_block_stmt = stmt.starts_with("if")
 					|| stmt.starts_with("while")
@@ -1189,34 +1508,60 @@ impl Transpiler {
 	}
 }
 
-// --- MAIN ---
+/// Compiles a single `.ez` source file to a `.php` output file.
+///
+/// Reads `filename` from disk, lexes it, transpiles it, and writes the result
+/// to a sibling file with the `.ez` extension replaced by `.php`.
+///
+/// Progress and error messages are printed to stderr/stdout as appropriate.
+///
+/// # Arguments
+///
+/// * `filename` – Path to the `.ez` source file.
+/// * `strict` – Passed directly to [`Transpiler::new`]; enables mandatory type
+///   annotations and static type checking.
+///
+/// # Returns
+///
+/// `true` if compilation succeeded and the output file was written; `false`
+/// otherwise (all errors are already printed to stderr).
+fn compile_file(filename: &str, strict: bool) -> bool {
+        let path = Path::new(filename);
 
-/// Compiles a single `.ez` file and writes the result to a `.php` file with the same base name.
-/// Returns true on success, false on any error.
-fn compile_file(filename: &str) -> bool {
-	let code = match fs::read_to_string(filename) {
-		Ok(c) => c,
-		Err(_) => { eprintln!("Error: File '{}' not found.", filename); return false; }
-	};
+        let code = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => { eprintln!("Error: File '{}' not found.", filename); return false; }
+        };
+
 	let tokens = match lexer(&code) {
 		Ok(t) => t,
 		Err(e) => { eprintln!("{}: {}", filename, e); return false; }
 	};
-	let mut transpiler = Transpiler::new(tokens);
+	let mut transpiler = Transpiler::new(tokens, strict);
 	let php_result = match transpiler.transpile() {
 		Ok(r) => r,
 		Err(e) => { eprintln!("{}: {}", filename, e); return false; }
 	};
-	let output_filename = filename.replace(".ez", ".php");
-	match fs::write(&output_filename, &php_result) {
-		Ok(_) => { println!("Compiled {} -> {}", filename, output_filename); true }
-		Err(e) => { eprintln!("Failed to write {}: {}", output_filename, e); false }
-	}
+	let output_path = path.with_extension("php");
+        match fs::write(&output_path, &php_result) {
+            Ok(_) => { println!("Compiled {} -> {}", path.display(), output_path.display()); true }
+            Err(e) => { eprintln!("Failed to write {}: {}", output_path.display(), e); false }
+        }
 }
 
-/// Recursively walks `dir` and compiles every `.ez` file found.
-/// Updates `found` and `failed` counters in place.
-fn compile_dir(dir: &str, found: &mut usize, failed: &mut usize) {
+/// Recursively compiles all `.ez` files found under `dir`.
+///
+/// Walks the directory tree depth-first.  For each `.ez` file encountered,
+/// [`compile_file`] is called and the counters are updated.  Subdirectories
+/// are traversed automatically.
+///
+/// # Arguments
+///
+/// * `dir` – Path to the root directory to search.
+/// * `strict` – Forwarded to every [`compile_file`] call.
+/// * `found` – Mutable counter incremented for each `.ez` file discovered.
+/// * `failed` – Mutable counter incremented for each file that fails to compile.
+fn compile_dir(dir: &str, strict: bool, found: &mut usize, failed: &mut usize) {
 	let entries = match fs::read_dir(dir) {
 		Ok(e) => e,
 		Err(e) => { eprintln!("Error: Cannot read directory '{}': {}", dir, e); return; }
@@ -1225,29 +1570,47 @@ fn compile_dir(dir: &str, found: &mut usize, failed: &mut usize) {
 		let path = entry.path();
 		if path.is_dir() {
 			if let Some(p) = path.to_str() {
-				compile_dir(p, found, failed);
+				compile_dir(p, strict, found, failed);
 			}
 		} else if path.extension().and_then(|e| e.to_str()) == Some("ez") {
 			if let Some(p) = path.to_str() {
 				*found += 1;
-				if !compile_file(p) { *failed += 1; }
+				if !compile_file(p, strict) { *failed += 1; }
 			}
 		}
 	}
 }
 
-/// Entry point.
-/// - `ezlang <file.ez>`           compiles a single file
-/// - `ezlang --dir|-d <folder>`   recursively compiles all `.ez` files in a folder
+/// Entry point for the `PHPlus` compiler CLI.
+///
+/// Parses command-line arguments and dispatches to either [`compile_file`] or
+/// [`compile_dir`].
+///
+/// # Usage
+///
+/// ```text
+/// ./phplus <file.ez>
+/// ./phplus --dir|-d <folder>
+/// ./phplus --no-strict|-ns <file.ez>
+/// ./phplus --no-strict|-ns --dir|-d <folder>
+/// ```
+///
+/// Flags may appear in any order relative to `--no-strict`/`-ns`; they are
+/// filtered out before positional argument processing.  If no source file or
+/// directory is provided, a usage message is printed to stderr and the process
+/// exits.
 fn main() {
 	let args: Vec<String> = env::args().collect();
 
-	let is_dir_flag = args.len() >= 3 && (args[1] == "--dir" || args[1] == "-d");
+	let strict = !args.iter().any(|a| a == "--no-strict" || a == "-ns");
+	let filtered: Vec<&String> = args.iter().filter(|a| *a != "--no-strict" && *a != "-ns").collect();
+
+	let is_dir_flag = filtered.len() >= 3 && (filtered[1] == "--dir" || filtered[1] == "-d");
 	if is_dir_flag {
-		let dir = &args[2];
+		let dir = filtered[2];
 		let mut found = 0usize;
 		let mut failed = 0usize;
-		compile_dir(dir, &mut found, &mut failed);
+		compile_dir(dir, strict, &mut found, &mut failed);
 		if found == 0 {
 			println!("No .ez files found in '{}'", dir);
 		} else {
@@ -1256,12 +1619,14 @@ fn main() {
 		return;
 	}
 
-	if args.len() < 2 {
+	if filtered.len() < 2 {
 		eprintln!("Usage:");
-		eprintln!("  ezlang <file.ez>              compile a single file");
-		eprintln!("  ezlang --dir|-d <folder>      recursively compile all .ez files in a folder");
+		eprintln!("  ./phplus <file.ez>                        compile a single file");
+		eprintln!("  ./phplus --dir|-d <folder>                recursively compile all .ez files");
+		eprintln!("  ./phplus --no-strict|-ns <file.ez>        compile without type annotation enforcement");
+		eprintln!("  ./phplus --no-strict|-ns --dir|-d <folder>");
 		return;
 	}
 
-	compile_file(&args[1]);
+	compile_file(filtered[1], strict);
 }
