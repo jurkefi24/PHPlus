@@ -96,6 +96,7 @@ enum TokenKind {
 	Dot,    // . property access
 	Comma,  // , parameter separator
 	Private, // private keyword
+	Include, // include keyword
 }
 
 /// A single lexical unit produced by the lexer.
@@ -242,6 +243,7 @@ fn lexer(code: &str) -> Result<Vec<Token>, LangError> {
 					"return"  => TokenKind::Return,
 					"self"    => TokenKind::Self_,
 					"private" => TokenKind::Private,
+					"include" => TokenKind::Include,
 					"int"     => TokenKind::TypeInt,
 					"float"   => TokenKind::TypeFloat,
 					"string"  => TokenKind::TypeString,
@@ -917,6 +919,26 @@ impl Transpiler {
 					None     => Ok(format!("function {}({}) {{\n{}{}}}", fn_name, param_str, body, indent)),
 				}
 			}
+			Some(TokenKind::Include) => {															// include "file.ez" — emits require_once in PHP
+				self.consume();
+				let path_tok = match self.consume() {
+					Some(t) if t.kind == TokenKind::String => t,
+					Some(t) => return Err(LangError::new(
+						format!("Expected file path string after 'include', got '{}'", t.value),
+						t.line, t.col,
+					)),
+					None => return Err(LangError::new("Expected file path string after 'include'", 0, 0)),
+				};
+				let ez_path = path_tok.value.trim_matches('"').to_string();
+				if !ez_path.ends_with(".ez") {
+					return Err(LangError::new(
+						format!("include path must end in .ez, got '{}'", ez_path),
+						path_tok.line, path_tok.col,
+					));
+				}
+				let php_path = ez_path.replace(".ez", ".php");
+				Ok(format!("require_once '{}'", php_path))
+			}
 			Some(TokenKind::Class) => {																	// class Name { let prop = val ... fn method(params) { ... } }
 				let class_tok = self.consume().unwrap();
 				let class_name = match self.consume() {
@@ -1169,36 +1191,77 @@ impl Transpiler {
 
 // --- MAIN ---
 
-/// Entry point. Reads a `.ez` source file, runs the lexer and transpiler,
-/// and writes the resulting PHP to a `.php` file with the same base name.
-fn main() {
-	let args: Vec<String> = env::args().collect();
-	if args.len() < 2 {
-		eprintln!("Usage: ezlang <filename.ez>");
-		return;
-	}
-
-	let filename = &args[1];
-
+/// Compiles a single `.ez` file and writes the result to a `.php` file with the same base name.
+/// Returns true on success, false on any error.
+fn compile_file(filename: &str) -> bool {
 	let code = match fs::read_to_string(filename) {
 		Ok(c) => c,
-		Err(_) => { eprintln!("Error: File '{}' not found.", filename); return; }
+		Err(_) => { eprintln!("Error: File '{}' not found.", filename); return false; }
 	};
-
 	let tokens = match lexer(&code) {
 		Ok(t) => t,
-		Err(e) => { eprintln!("{}", e); return; }
+		Err(e) => { eprintln!("{}: {}", filename, e); return false; }
 	};
-
 	let mut transpiler = Transpiler::new(tokens);
 	let php_result = match transpiler.transpile() {
 		Ok(r) => r,
-		Err(e) => { eprintln!("{}", e); return; }
+		Err(e) => { eprintln!("{}: {}", filename, e); return false; }
 	};
-
 	let output_filename = filename.replace(".ez", ".php");
 	match fs::write(&output_filename, &php_result) {
-		Ok(_) => println!("Successfully compiled {} to {}", filename, output_filename),
-		Err(e) => eprintln!("Failed to write output: {}", e),
+		Ok(_) => { println!("Compiled {} -> {}", filename, output_filename); true }
+		Err(e) => { eprintln!("Failed to write {}: {}", output_filename, e); false }
 	}
+}
+
+/// Recursively walks `dir` and compiles every `.ez` file found.
+/// Updates `found` and `failed` counters in place.
+fn compile_dir(dir: &str, found: &mut usize, failed: &mut usize) {
+	let entries = match fs::read_dir(dir) {
+		Ok(e) => e,
+		Err(e) => { eprintln!("Error: Cannot read directory '{}': {}", dir, e); return; }
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			if let Some(p) = path.to_str() {
+				compile_dir(p, found, failed);
+			}
+		} else if path.extension().and_then(|e| e.to_str()) == Some("ez") {
+			if let Some(p) = path.to_str() {
+				*found += 1;
+				if !compile_file(p) { *failed += 1; }
+			}
+		}
+	}
+}
+
+/// Entry point.
+/// - `ezlang <file.ez>`           compiles a single file
+/// - `ezlang --dir|-d <folder>`   recursively compiles all `.ez` files in a folder
+fn main() {
+	let args: Vec<String> = env::args().collect();
+
+	let is_dir_flag = args.len() >= 3 && (args[1] == "--dir" || args[1] == "-d");
+	if is_dir_flag {
+		let dir = &args[2];
+		let mut found = 0usize;
+		let mut failed = 0usize;
+		compile_dir(dir, &mut found, &mut failed);
+		if found == 0 {
+			println!("No .ez files found in '{}'", dir);
+		} else {
+			println!("\nDone: {}/{} files compiled successfully.", found - failed, found);
+		}
+		return;
+	}
+
+	if args.len() < 2 {
+		eprintln!("Usage:");
+		eprintln!("  ezlang <file.ez>              compile a single file");
+		eprintln!("  ezlang --dir|-d <folder>      recursively compile all .ez files in a folder");
+		return;
+	}
+
+	compile_file(&args[1]);
 }
